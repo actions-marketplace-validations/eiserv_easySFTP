@@ -1,0 +1,137 @@
+package uploader
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"sort"
+	"strings"
+	"sync/atomic"
+
+	"github.com/pkg/sftp"
+
+	"github.com/eiserv/easySFTP/internal/config"
+	"github.com/eiserv/easySFTP/internal/metrics"
+)
+
+// deleteRemoteFiles removes paths through a bounded worker pool. The returned
+// slice is aligned with paths and records every delete that completed, even
+// when another worker failed. Sync uses that exact accounting for its recovery
+// manifest, and clean uses it for partial-progress statistics.
+func deleteRemoteFiles(ctx context.Context, cfg *config.Config, sess *session, paths []string, watch *stallWatchdog, log Logger) ([]bool, error) {
+	deleted := make([]bool, len(paths))
+	if cfg.DryRun {
+		for i, remotePath := range paths {
+			if cfg.LogPerFile() {
+				log.Infof("%sdelete %s", planVerb(cfg), remotePath)
+			}
+			deleted[i] = true
+		}
+		return deleted, nil
+	}
+
+	err := runBounded(ctx, sess.workers(len(paths)), len(paths), func(groupCtx context.Context, i int) error {
+		remotePath := paths[i]
+		if cfg.LogPerFile() {
+			log.Infof("delete %s", remotePath)
+		}
+		err := sess.do(groupCtx, watch, func(client *sftp.Client) error {
+			// Already-gone counts as deleted: a retried delete may have
+			// landed before the connection died, and sync deletes what its
+			// manifest recorded, which someone may have removed on the server
+			// since. Servers that do not distinguish "not there" from
+			// "refused" in the status code are asked directly; see
+			// remoteAbsent.
+			done := metrics.Op("sftp_remove")
+			err := client.Remove(remotePath)
+			done(err)
+			watch.tick()
+			if err == nil || errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			absent, aerr := remoteAbsent(client, remotePath, watch)
+			if aerr != nil {
+				return aerr
+			}
+			if absent {
+				return nil
+			}
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("deleting %q: %w", remotePath, err)
+		}
+		deleted[i] = true
+		return nil
+	})
+	return deleted, err
+}
+
+func countDeleted(deleted []bool) int {
+	n := 0
+	for _, ok := range deleted {
+		if ok {
+			n++
+		}
+	}
+	return n
+}
+
+// removeRemoteDirs removes independent directories at the same depth in
+// parallel, while keeping the real child-before-parent dependency between
+// depths. Directory removal is best effort, matching the previous behavior:
+// a non-empty or unreadable directory is left in place. It returns how many
+// directories it actually removed, which is what the run reports as
+// dirs-deleted.
+//
+// budget is non-nil only where the count could not be reserved in advance
+// (the sync mode's prune of directories it just emptied): removals are then
+// charged one at a time and pruning stops once the budget is spent. The clean
+// mode reserves its whole listing up front and passes nil; see deleteBudget
+// and issue #237.
+func removeRemoteDirs(ctx context.Context, cfg *config.Config, sess *session, watch *stallWatchdog, dirs []string, budget *deleteBudget) int {
+	if len(dirs) == 0 {
+		return 0
+	}
+	if cfg.DryRun {
+		// The planned count, like every other dry-run number.
+		return len(dirs)
+	}
+	var removed atomic.Int64
+	byDepth := make(map[int][]string)
+	var depths []int
+	for _, dir := range dirs {
+		depth := strings.Count(path.Clean(dir), "/")
+		if _, ok := byDepth[depth]; !ok {
+			depths = append(depths, depth)
+		}
+		byDepth[depth] = append(byDepth[depth], dir)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(depths)))
+	for _, depth := range depths {
+		level := byDepth[depth]
+		_ = runBounded(ctx, sess.workers(len(level)), len(level), func(groupCtx context.Context, i int) error {
+			dir := level[i]
+			if budget != nil && !budget.take() {
+				return nil
+			}
+			err := sess.do(groupCtx, watch, func(client *sftp.Client) error {
+				done := metrics.Op("sftp_rmdir")
+				err := client.RemoveDirectory(dir)
+				done(err)
+				watch.tick()
+				return err
+			})
+			switch {
+			case err == nil:
+				removed.Add(1)
+			case budget != nil:
+				budget.refund()
+			}
+			return nil
+		})
+	}
+	return int(removed.Load())
+}

@@ -13,6 +13,11 @@ Set the mode inline with the `mode` input, or in the
 [config file](configuration.md#the-config-file) as `defaults.mode` (global)
 or a per-deployment `mode`.
 
+Before uploading, easySFTP creates remote directory leaves in parallel and
+checks touched directories for stale temporary files with up to
+`advanced.concurrency` SFTP requests. Directory permission updates use the
+same bound. These metadata requests stay on the first SSH connection.
+
 > **Renamed in v3.** What v2 called the `strategy` input (and `strategy:` in
 > the config file) is the `mode` input and `mode:` field in v3. The three
 > behaviors are unchanged. See the [migration guide](migration-v3.md).
@@ -26,7 +31,10 @@ Uploads are **atomic per file**: content is streamed to a temporary sibling
 file (`<name>.easysftp-tmp.<n>`, `<n>` being the file's position in the plan so
 two planned transfers never share a temp name) and renamed over the target
 only once the transfer fully succeeded. A broken connection never leaves a
-half-written file where the live one was.
+half-written file where the live one was. Servers without
+`posix-rename@openssh.com` cannot do that swap in one step, so easySFTP parks
+the live file under `<name>.easysftp-tmp.bak` first and puts it back if the
+rename fails: the target is briefly missing there, but never lost.
 
 ### `advanced.skip_unchanged`: skip same-size files
 
@@ -74,8 +82,9 @@ Notes:
 - A run that fails partway still records what it actually changed in the
   manifest (best effort), so a retried deploy resumes where it left off
   instead of re-uploading files that already made it.
-- Local files are hashed in parallel through a worker pool bounded by
-  `advanced.concurrency`, so planning a large tree uses the available runner CPU.
+- Local files are hashed in parallel using the runner's available Go CPU
+  parallelism. This is independent of `advanced.concurrency`, which can be
+  lowered for an SFTP server without serializing local hashing.
 - Remote directories are only created (or confirmed) for files actually being
   uploaded, so a sync with nothing to do costs just the manifest read and
   rewrite, no per-directory round-trips. Exception: with `permissions.directories`
@@ -105,9 +114,12 @@ for it last time, its stored hash is reused and the file is never re-read.
 This is the same trade rsync's "quick check" makes.
 
 **The trade-off, precisely:** a file whose content changed *without* its size
-or modification time changing is invisible to this check and will be missed;
-for example, two edits that happen to produce the same file size within the
-same mtime second (mtimes have one-second resolution on most filesystems).
+or modification time changing is invisible to this check and will be missed.
+Modification times are compared at nanosecond resolution, so on common
+filesystems (ext4, APFS, NTFS) that takes two same-size edits with
+bit-identical timestamps; on filesystems with coarse timestamps (FAT stores
+2-second mtimes, and some network filesystems round to seconds), the window
+stays as wide as the filesystem's own clock.
 Without `fast_path`, `sync` never misses a content change, because it
 always compares actual content hashes; this is what you give up in exchange
 for skipping local reads.
@@ -124,9 +136,10 @@ If you suspect a stale hash was reused for the wrong reason, delete the
 target's `.easysftp-manifest.json` (or run `mode: clean` once) to force a
 full re-hash on the next sync.
 
-Manifests written before this option existed have no recorded modification
-time; the first sync after upgrading re-hashes everything once and then
-starts recording it. (A v2 manifest is read seamlessly.)
+Manifests written by older easySFTP versions are read seamlessly, but their
+recorded modification times are not comparable (v1 recorded none, v2 recorded
+whole seconds); the first sync after upgrading re-hashes everything once and
+then records nanosecond times from there on.
 
 ## `clean`
 
@@ -134,15 +147,43 @@ Deletes **everything** inside the remote target directory first, then uploads
 all local files. Use it when you want a guaranteed-fresh deploy and nothing in
 the target directory needs to survive.
 
+The recursive scan and file deletions run with up to `advanced.concurrency`
+independent SFTP requests. Empty directories are removed deepest-first, with
+siblings at the same depth handled in parallel. `sync` uses the same bounded
+delete pool. The guards below are evaluated against the complete file list
+before any delete worker starts.
+
 ## Delete guards
 
 Two safety nets apply before `sync` or `clean` delete anything:
 
-- **Remote root is always refused.** A target that resolves to `/` (or `.`)
-  is rejected outright. No mode will ever wipe a server root.
-- **`max_deletes`** aborts a run that would delete more files than the limit,
-  catching a misconfiguration before it does damage. `0` means unlimited. Set
-  it via `safety.max_deletes` in the [config file](configuration.md#sections).
+- **Remote root is always refused.** A target that resolves to `/`, `.`, `~`
+  or the empty string is rejected outright. So is one that climbs above the
+  directory the session starts in, such as `..`, `../..` or `dist/../..`,
+  which is where a target built from a workflow expression tends to land when
+  the expression is empty or has a component too many. No mode will ever wipe
+  a server root or a login directory. A relative target that stays put, like
+  `www/public_html`, is unaffected.
+- **`max_deletes`** aborts a run that would remove more remote entries than
+  the limit, catching a misconfiguration before it does damage. `0` means
+  unlimited, and is the default. Set it via `safety.max_deletes` in the
+  [config file](configuration.md#sections).
+
+  Three details, because they are easy to guess wrong:
+
+  - **It counts directories too**, not just files. A `clean` run against a
+    tree of 10,000 empty directories is 10,000 removals as far as the guard is
+    concerned. The run reports the two apart, as the `files-deleted` and
+    `dirs-deleted` outputs, but they share one budget.
+  - **It is for the whole run**, not per deployment. A config file with eight
+    deployments and `max_deletes: 100` allows 100 removals in total, and the
+    deployment that would take the run past the limit is the one that is
+    refused.
+  - **A run that would go over is refused before it removes anything.** The
+    one exception is the `sync` mode's pruning of directories it has just
+    emptied: those are only known after the deletions they follow, so an
+    exhausted budget stops the pruning instead of failing a run whose real
+    work already succeeded.
 
 ## Dry runs
 

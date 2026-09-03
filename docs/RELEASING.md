@@ -52,6 +52,33 @@ version tags or releases by hand.
    `docs/configuration.md`, and `docs/security.md`, plus the README
    "Versioning" section. They do not update themselves (see issue #63).
 
+## Benchmarks around a release
+
+The `SFTP benchmark` workflow rides along with this flow and needs no manual
+step:
+
+- When the release PR opens, it is benchmarked once and the numbers appear in
+  that run's job summary. Nothing is stored yet.
+- After Release Please created the release, the `Release` workflow calls the
+  benchmark with the new tag. The tagged code is measured and the result is
+  committed to `main` as `benchmarks/releases/release-vX.Y.Z.*`, the official
+  reference for that version, together with an updated `benchmarks/latest.json`
+  and `benchmarks/latest.md`.
+- Releases older than the current one plus four move to
+  `benchmarks/archive/releases/`.
+
+The benchmark is a `uses:` call from the `Release` workflow and **not** an
+`on: release` trigger: Release Please creates the release with the
+`GITHUB_TOKEN`, and events raised by that token never start a workflow run.
+The binary pipeline is wired the same way for the same reason.
+
+Both runs need the `BENCHMARK_SFTP_*` secrets. The benchmark job failing does
+not undo or block the release; the tag, the GitHub Release and the binaries are
+produced by other jobs. If a release ended up without its benchmark, start the
+`SFTP benchmark` workflow by hand with `release-version` set to that tag. It
+stores the missing official reference and refuses to touch one that already
+exists. See [`benchmarks/README.md`](../benchmarks/README.md).
+
 ## Stable asset names
 
 ```text

@@ -255,8 +255,9 @@ deployments:
 
 ## Windows and macOS runners
 
-Nothing changes: easySFTP is a compiled Go binary and runs natively on
-`ubuntu-*`, `macos-*` and `windows-*` runners (no Docker required):
+The workflow does not change: easySFTP is a compiled Go binary and runs
+natively on `ubuntu-*`, `macos-*` and `windows-*` runners (no Docker
+required):
 
 ```yaml
 jobs:
@@ -273,3 +274,21 @@ jobs:
           source: .\build\
           target: /var/www/html/
 ```
+
+One thing does differ on Windows: file permissions. Windows has no POSIX
+permission bits, so the default "mirror the local mode" uploads every writable
+file as `0666` (`0444` for read-only ones), where the same deploy from
+`ubuntu-latest` would upload `0644`. If your server or a security scan cares,
+set the modes explicitly, two more lines in the same step:
+
+```yaml
+          source: .\build\
+          target: /var/www/html/
+          file-mode: "0644"
+          dir-mode: "0755"
+```
+
+In config mode the same settings are `permissions.files` and
+`permissions.directories`.
+
+macOS runners have real permission bits and need none of this.

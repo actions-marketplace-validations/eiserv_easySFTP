@@ -110,11 +110,42 @@ type Proxy struct {
 	AllowAnyHostKey bool
 }
 
-// Guards holds the safety limits applied before any destructive operation.
-type Guards struct {
+// SSHAlgorithms contains additive SSH negotiation choices from
+// connection.algorithms. Empty slices preserve x/crypto/ssh's defaults for
+// that category. Insecure records the explicitly requested algorithms which
+// x/crypto/ssh classifies as insecure, so the uploader and job summary can
+// report the security tradeoff without classifying the same input again.
+type SSHAlgorithms struct {
+	KeyExchanges      []string
+	Ciphers           []string
+	MACs              []string
+	HostKeyAlgorithms []string
+	Insecure          []string
+}
+
+// Configured reports whether any SSH algorithm category was explicitly set.
+func (a SSHAlgorithms) Configured() bool {
+	return len(a.KeyExchanges) > 0 || len(a.Ciphers) > 0 || len(a.MACs) > 0 || len(a.HostKeyAlgorithms) > 0
+}
+
+// Safety holds the safety limits applied before any destructive operation.
+// The field and type names mirror the config file's "safety" section on
+// purpose: a name that drifts from the YAML key leaks into error messages
+// and sends users to a key that does not exist (issue #140).
+type Safety struct {
 	// MaxDeletes refuses a run that would delete more than this many files.
 	// 0 means unlimited. The refusal to delete the remote root is always on.
 	MaxDeletes int
+}
+
+// AutoSettings marks the transport settings whose value easySFTP works out
+// for itself. They are independent on purpose: a run may pin connections and
+// leave the other two adaptive, and the policy then optimizes within the
+// constraint the pinned one imposes.
+type AutoSettings struct {
+	Connections        bool
+	Concurrency        bool
+	RequestConcurrency bool
 }
 
 // Config holds the fully parsed action configuration.
@@ -134,13 +165,16 @@ type Config struct {
 	// pinned keys and without this opt-in, the run fails instead of talking
 	// to an unverified server.
 	AllowAnyHostKey bool
+	// Algorithms adds explicitly requested SSH algorithms to the safe set for
+	// both the target and an optional proxy hop. It is config-file-only.
+	Algorithms SSHAlgorithms
 
 	// Proxy, if non-nil, routes the connection through a jump host.
 	Proxy *Proxy
 
 	Uploads     []UploadPair
 	IgnoreLines []string
-	Guards      Guards
+	Safety      Safety
 
 	// ConfigPath is the path of the loaded YAML config file, or "" in inline
 	// mode. It drives config-mode error message wording and the job summary.
@@ -157,9 +191,37 @@ type Config struct {
 	DryRun                 bool
 	Concurrency            int
 	SftpRequestConcurrency int
-	Retries                int
-	Timeout                time.Duration
-	SyncFastPath           bool
+
+	// Connections is how many SSH connections a run may open, so uploads can
+	// use more than one TCP flow and more than one cipher stream (issue #158).
+	// 1 (the default) keeps the single-connection behavior. Never more than
+	// Concurrency: a connection without a worker on it is a handshake for
+	// nothing.
+	Connections int
+
+	// Auto records which of the three transport settings above the user left
+	// at "auto" (or did not write at all), and is therefore easySFTP's to
+	// choose. The int fields keep the historical fixed defaults so that code
+	// which never consults the policy (and a Config built directly in a test)
+	// behaves exactly as it did; internal/autotune replaces them per
+	// deployment once the plan and the link are known. See docs/tuning.md and
+	// issue #209.
+	Auto AutoSettings
+
+	// AutoCachePath, when set, is a local file where easySFTP remembers what
+	// it measured about this server, so the next run can plan from a
+	// measurement instead of its built-in assumption. Empty (the default)
+	// switches the cache off entirely: nothing is read and nothing is
+	// written.
+	//
+	// It only ever feeds settings left at "auto", and it only ever supplies
+	// inputs; the policy still decides. See internal/autocache, docs/tuning.md
+	// and issue #212.
+	AutoCachePath string
+
+	Retries      int
+	Timeout      time.Duration
+	SyncFastPath bool
 
 	// StallTimeout, if positive, aborts the run when active transfers make
 	// no progress for this long, instead of hanging until the job-level
@@ -221,13 +283,40 @@ func (c *Config) SyncManifestName() string {
 
 const envPrefix = "EASYSFTP_"
 
-// Run-wide defaults, applied in inline mode and overridable per config file.
+// Run-wide defaults. The three transport numbers are the values easySFTP used
+// before the settings became adaptive; they are the fallback a Config carries
+// while the policy has not run (and the value a directly constructed Config
+// keeps), never a choice the policy makes. See AutoSettings.
 const (
 	defaultConcurrency        = 4
 	defaultRequestConcurrency = 16
+	defaultConnections        = 1
 	defaultRetries            = 2
 	defaultTimeoutSec         = 30
 )
+
+// Defaults returns the configuration a run starts from before a single input
+// or config-file field is read.
+//
+// It exists so that anything needing to describe "the easySFTP defaults" reads
+// them instead of restating them. The benchmark harness names them in every
+// stored result, and because it restated them, two permanent documents claim a
+// run at "concurrency 4, request_concurrency 16" that in fact resolved all
+// three through the auto policy (issue #229).
+func Defaults() *Config {
+	return &Config{
+		Concurrency:            defaultConcurrency,
+		SftpRequestConcurrency: defaultRequestConcurrency,
+		Connections:            defaultConnections,
+		// Adaptive unless the config file pins a number. Inline mode has no
+		// input for any of the three (every non-secret setting has exactly
+		// one home in v3), so an inline run is always fully adaptive.
+		Auto:         AutoSettings{Connections: true, Concurrency: true, RequestConcurrency: true},
+		Retries:      defaultRetries,
+		Timeout:      defaultTimeoutSec * time.Second,
+		ManifestName: DefaultManifestName,
+	}
+}
 
 // removedInput maps a v2 input's environment variable to its migration hint.
 // The inputs stay declared in action.yml (without defaults) so a workflow
@@ -253,9 +342,6 @@ var removedInputs = []removedInput{
 	{"SYNC_FAST_PATH", "the 'sync-fast-path' input moved to 'sync.fast_path' in the config file"},
 	{"MANIFEST_NAME", "the 'manifest-name' input moved to 'sync.manifest' in the config file"},
 	{"SKIP_UNCHANGED", "the 'skip-unchanged' input moved to 'advanced.skip_unchanged' in the config file"},
-	{"DIR_MODE", "the 'dir-mode' input moved to 'permissions.directories' in the config file"},
-	{"FILE_MODE", "the 'file-mode' input moved to 'permissions.files' in the config file"},
-	{"PRESERVE_TIMES", "the 'preserve-times' input moved to 'permissions.preserve_times' in the config file"},
 	{"PROXY_SERVER", "the 'proxy-server' input moved to 'connection.proxy.host' in the config file"},
 	{"PROXY_PORT", "the 'proxy-port' input moved to 'connection.proxy.port' in the config file"},
 	{"PROXY_USERNAME", "the 'proxy-username' input moved to 'connection.proxy.username' in the config file"},
@@ -288,6 +374,9 @@ var inlineOnlyInputs = []struct{ env, input string }{
 	{"TARGET", "target"},
 	{"MODE", "mode"},
 	{"EXCLUDE", "exclude"},
+	{"FILE_MODE", "file-mode"},
+	{"DIR_MODE", "dir-mode"},
+	{"PRESERVE_TIMES", "preserve-times"},
 }
 
 // Load reads the configuration from the environment and validates it.
@@ -300,16 +389,10 @@ func Load() (*Config, error) {
 		return strings.TrimSpace(os.Getenv(envPrefix + name))
 	}
 
-	cfg := &Config{
-		Password:               os.Getenv(envPrefix + "PASSWORD"),
-		PrivateKey:             os.Getenv(envPrefix + "PRIVATE_KEY"),
-		Passphrase:             os.Getenv(envPrefix + "PASSPHRASE"),
-		Concurrency:            defaultConcurrency,
-		SftpRequestConcurrency: defaultRequestConcurrency,
-		Retries:                defaultRetries,
-		Timeout:                defaultTimeoutSec * time.Second,
-		ManifestName:           DefaultManifestName,
-	}
+	cfg := Defaults()
+	cfg.Password = os.Getenv(envPrefix + "PASSWORD")
+	cfg.PrivateKey = os.Getenv(envPrefix + "PRIVATE_KEY")
+	cfg.Passphrase = os.Getenv(envPrefix + "PASSPHRASE")
 
 	var err error
 	if cfg.DryRun, err = parseBool(get("DRY_RUN"), false); err != nil {
@@ -379,6 +462,15 @@ func loadInline(cfg *Config, get func(string) string) error {
 	if cfg.AllowAnyHostKey, err = parseBool(get("ALLOW_ANY_HOST_KEY"), false); err != nil {
 		return fmt.Errorf("invalid allow-any-host-key: %w", err)
 	}
+	if cfg.FileMode, err = parseMode(get("FILE_MODE"), "input 'file-mode'"); err != nil {
+		return err
+	}
+	if cfg.DirMode, err = parseMode(get("DIR_MODE"), "input 'dir-mode'"); err != nil {
+		return err
+	}
+	if cfg.PreserveTimes, err = parseBool(get("PRESERVE_TIMES"), false); err != nil {
+		return fmt.Errorf("invalid preserve-times: %w", err)
+	}
 
 	strategy := StrategyOverlay
 	if mode := get("MODE"); mode != "" {
@@ -420,14 +512,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("advanced.concurrency must be at least 1, got %d", c.Concurrency)
 	case c.SftpRequestConcurrency < 1:
 		return fmt.Errorf("advanced.request_concurrency must be at least 1, got %d", c.SftpRequestConcurrency)
+	case c.Connections < 1:
+		return fmt.Errorf("advanced.connections must be at least 1, got %d", c.Connections)
 	case c.Retries < 0:
 		return fmt.Errorf("advanced.retries must not be negative, got %d", c.Retries)
 	case c.Timeout < 0:
 		return fmt.Errorf("advanced.timeout must not be negative (use 0 to disable the timeout), got %d", int(c.Timeout/time.Second))
 	case c.StallTimeout < 0:
 		return fmt.Errorf("advanced.stall_timeout must not be negative (use 0 to disable the check), got %d", int(c.StallTimeout/time.Second))
-	case c.Guards.MaxDeletes < 0:
-		return fmt.Errorf("safety.max_deletes must not be negative, got %d", c.Guards.MaxDeletes)
+	case c.Safety.MaxDeletes < 0:
+		return fmt.Errorf("safety.max_deletes must not be negative, got %d", c.Safety.MaxDeletes)
 	}
 	if p := c.Proxy; p != nil {
 		switch {

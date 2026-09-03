@@ -10,32 +10,46 @@ import (
 	"io"
 	"os"
 	"path"
+	"runtime"
 	"sort"
 
 	"github.com/pkg/sftp"
 
 	"github.com/eiserv/easySFTP/internal/config"
+	"github.com/eiserv/easySFTP/internal/metrics"
 )
 
-// manifestName is the default file name the sync strategy keeps in each remote
-// target to record what it previously uploaded. Only files listed there are
-// ever deleted, so files placed on the server by others are left untouched.
-// The manifest-name input can override it per run; see Config.SyncManifestName.
-const manifestName = config.DefaultManifestName
-
 // manifestVersion is written to every manifest this version of easySFTP
-// produces. v1 manifests (hash only, no size/mtime) are still read; see
-// readManifest.
-const manifestVersion = 2
+// produces. Older manifests are still read: v1 (hash only, no size/mtime)
+// and v2 (mtime in whole seconds); see readManifest.
+const manifestVersion = 3
+
+// maxManifestBytes caps what readManifest will pull into memory. The manifest
+// is a remote file, so its size is not this run's to trust: without a cap, a
+// server (or anything that can write the deploy target) turns a sync into an
+// unbounded allocation. At roughly 120 bytes per entry this still admits about
+// half a million files, far past any plausible deployment, and an over-size
+// manifest degrades to a first sync exactly like an unreadable one. See
+// issue #223.
+//
+// A var rather than a const only so the size test can lower it instead of
+// seeding 64 MiB through the in-process server; no test in this package runs
+// in parallel.
+var maxManifestBytes int64 = 64 << 20
 
 // manifestEntry records what is known about one file from the last sync.
-// Size and MTime enable the size+mtime fast path in hashPlanFiles: a v1
-// manifest entry has MTime 0, which never matches and always falls back to a
-// full re-hash.
+// Size and MTime enable the size+mtime fast path in hashPlanFiles: an entry
+// with MTime 0 never matches and always falls back to a full re-hash.
+//
+// v3 records MTime in nanoseconds. v2 recorded whole seconds, which made a
+// same-size edit landing in the same wall-clock second as the recorded time
+// invisible to the fast path, so the file was silently never re-uploaded
+// (issue #162). Nanoseconds narrow that window to the filesystem's actual
+// timestamp granularity.
 type manifestEntry struct {
 	Hash  string `json:"hash"`
 	Size  int64  `json:"size"`
-	MTime int64  `json:"mtime"` // local modification time at upload, unix seconds
+	MTime int64  `json:"mtime"` // local modification time at upload, unix nanoseconds
 }
 
 // manifest records what the last sync uploaded, keyed by relative path.
@@ -48,7 +62,7 @@ type manifest struct {
 // manifest: it uploads new/changed files, deletes files that the previous sync
 // wrote but are now gone locally, prunes empty directories and rewrites the
 // manifest. Unchanged files are skipped.
-func executeSync(ctx context.Context, cfg *config.Config, sess *session, p plan, stats *Stats, watch *stallWatchdog, log Logger) error {
+func executeSync(ctx context.Context, cfg *config.Config, sess *session, p plan, stats *Stats, budget *deleteBudget, watch *stallWatchdog, log Logger) error {
 	verb := planVerb(cfg)
 	base := normalizeRemote(p.pair.Remote)
 
@@ -57,11 +71,14 @@ func executeSync(ctx context.Context, cfg *config.Config, sess *session, p plan,
 	// (within the shared reconnect budget) instead of failing the run, and a
 	// hung server trips stall-timeout; see issue #107.
 	var old manifest
-	if err := sess.do(ctx, watch, func(client *sftp.Client) error {
+	endRead := metrics.Phase("manifest_read")
+	err := sess.do(ctx, watch, func(client *sftp.Client) error {
 		var err error
 		old, err = readManifest(client, base, cfg.SyncManifestName(), log)
 		return err
-	}); err != nil {
+	})
+	endRead()
+	if err != nil {
 		return fmt.Errorf("reading sync manifest in %q: %w", base, err)
 	}
 
@@ -73,7 +90,14 @@ func executeSync(ctx context.Context, cfg *config.Config, sess *session, p plan,
 	if cfg.SyncFastPath {
 		cached = old.Files
 	}
-	if err := hashPlanFiles(ctx, p.files, cfg.Concurrency, cached); err != nil {
+	endHash := metrics.Phase("hash")
+	// Hashing is local CPU and disk work, so its worker count follows the
+	// runner rather than the server-facing upload limit. A user may reduce
+	// advanced.concurrency because their SFTP server rejects parallel writes;
+	// that must not serialize an unrelated local phase (issue #155).
+	err = hashPlanFiles(ctx, p.files, runtime.GOMAXPROCS(0), cached)
+	endHash()
+	if err != nil {
 		return fmt.Errorf("hashing local files under %q: %w", p.pair.Local, err)
 	}
 
@@ -88,9 +112,20 @@ func executeSync(ctx context.Context, cfg *config.Config, sess *session, p plan,
 
 	var toDelete []string // paths relative to base, ascending
 	for rel := range old.Files {
-		if _, ok := local[rel]; !ok {
-			toDelete = append(toDelete, rel)
+		if _, ok := local[rel]; ok {
+			continue
 		}
+		// The manifest lives in the deploy target, so its keys are data the
+		// server (or anything else that can write that one file) supplies,
+		// and every key that survives here becomes an argument to Remove.
+		// readManifest already drops keys that would leave the deployment;
+		// this re-checks at the point the key becomes a delete target, which
+		// is where the property is worth stating. See safeJoin and issue #223.
+		if _, err := safeJoin(base, rel); err != nil {
+			log.Warningf("ignoring sync manifest entry in %s: %v", base, err)
+			continue
+		}
+		toDelete = append(toDelete, rel)
 	}
 	sort.Strings(toDelete)
 
@@ -103,7 +138,7 @@ func executeSync(ctx context.Context, cfg *config.Config, sess *session, p plan,
 		if err := checkRemoteRoot(p.pair.Remote); err != nil {
 			return err
 		}
-		if err := checkMaxDeletes(len(toDelete), cfg); err != nil {
+		if err := budget.reserve(len(toDelete)); err != nil {
 			return err
 		}
 	}
@@ -118,35 +153,34 @@ func executeSync(ctx context.Context, cfg *config.Config, sess *session, p plan,
 		dirs = p.remoteDirs
 	}
 	// skip-unchanged is always off here: sync already decided what changed
-	// from the manifest hashes, which is strictly more precise.
-	completed, err := uploadFiles(ctx, cfg, sess, upload, dirs, stats, verb, watch, false, log)
+	// from the manifest hashes, which is strictly more precise. The full plan
+	// goes along with the changed subset because the stale-temp sweep must not
+	// remove an unchanged planned target that happens to be named like a temp
+	// file; see uploadFiles and issue #186.
+	completed, err := uploadFiles(ctx, cfg, sess, upload, p.files, dirs, p.remoteDirs, base, stats, verb, watch, false, log)
 	if err != nil {
 		writeRecoveryManifest(ctx, cfg, sess, watch, base, mergedManifest(old, upload, completed, nil), log)
 		return err
 	}
 
+	deletePaths := make([]string, len(toDelete))
+	for i, rel := range toDelete {
+		// Cannot fail: every entry of toDelete passed safeJoin above.
+		deletePaths[i], _ = safeJoin(base, rel)
+	}
+	endSweep := metrics.Phase("delete_sweep")
+	deleteResults, deleteErr := deleteRemoteFiles(ctx, cfg, sess, deletePaths, watch, log)
 	var deleted []string // relative paths actually removed, for the recovery manifest
-	for _, rel := range toDelete {
-		full := path.Join(base, rel)
-		if cfg.LogPerFile() {
-			log.Infof("%sdelete %s", verb, full)
+	for i, ok := range deleteResults {
+		if ok {
+			deleted = append(deleted, toDelete[i])
 		}
-		if !cfg.DryRun {
-			err := sess.do(ctx, watch, func(client *sftp.Client) error {
-				// Already-gone counts as deleted: a retried delete may have
-				// landed before the connection died.
-				if err := client.Remove(full); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return err
-				}
-				return nil
-			})
-			if err != nil {
-				writeRecoveryManifest(ctx, cfg, sess, watch, base, mergedManifest(old, upload, completed, deleted), log)
-				return fmt.Errorf("deleting %q: %w", full, err)
-			}
-		}
-		stats.FilesDeleted++
-		deleted = append(deleted, rel)
+	}
+	stats.FilesDeleted += len(deleted)
+	endSweep()
+	if deleteErr != nil {
+		writeRecoveryManifest(ctx, cfg, sess, watch, base, mergedManifest(old, upload, completed, deleted), log)
+		return deleteErr
 	}
 	stats.FilesSkipped += len(p.files) - len(upload)
 
@@ -156,12 +190,19 @@ func executeSync(ctx context.Context, cfg *config.Config, sess *session, p plan,
 
 	deletedFull := make([]string, len(deleted))
 	for i, rel := range deleted {
-		deletedFull[i] = path.Join(base, rel)
+		// deleted is a subset of toDelete, so this cannot fail either.
+		deletedFull[i], _ = safeJoin(base, rel)
 	}
-	pruneEmptyDirs(ctx, sess, watch, base, deletedFull)
-	if err := sess.do(ctx, watch, func(client *sftp.Client) error {
+	// The prune's directories are only known once the file deletions have
+	// happened, so they are charged one at a time and pruning stops (rather
+	// than the run failing) if the budget runs out; see deleteBudget.
+	stats.DirsDeleted += pruneEmptyDirs(ctx, cfg, sess, watch, base, deletedFull, budget)
+	endWrite := metrics.Phase("manifest_write")
+	err = sess.do(ctx, watch, func(client *sftp.Client) error {
 		return writeManifest(client, base, cfg.SyncManifestName(), manifest{Version: manifestVersion, Files: local})
-	}); err != nil {
+	})
+	endWrite()
+	if err != nil {
 		return fmt.Errorf("writing sync manifest in %q: %w", base, err)
 	}
 	return nil
@@ -227,25 +268,38 @@ func writeRecoveryManifest(ctx context.Context, cfg *config.Config, sess *sessio
 // into "first sync": the caller (sess.do) reconnects and retries the read, so
 // a mid-run drop cannot silently discard the manifest.
 //
-// Both the current (v2: hash+size+mtime) and old (v1: hash only) formats are
-// accepted; a v1 entry decodes with MTime 0, which never matches the fast
-// path in hashPlanFiles, so upgrading from a v1 manifest costs one full
-// re-hash and then writes v2 from then on.
+// All three formats are accepted: v3 (hash+size+mtime in nanoseconds), v2
+// (hash+size+mtime in whole seconds) and v1 (hash only). A v1 entry decodes
+// with MTime 0 and a v2 entry has its whole-second MTime dropped to 0, since
+// it must never be compared against the nanosecond values recorded now.
+// MTime 0 never matches the fast path in hashPlanFiles, so upgrading from an
+// older manifest costs one full re-hash and then writes v3 from then on.
 func readManifest(client *sftp.Client, dir, name string, log Logger) (manifest, error) {
 	empty := manifest{Version: manifestVersion, Files: map[string]manifestEntry{}}
-	f, err := client.Open(path.Join(dir, name))
+	manifestPath := path.Join(dir, name)
+	f, err := client.Open(manifestPath)
 	if err != nil {
 		if isConnError(err) {
 			return empty, err
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			log.Warningf("could not open sync manifest in %s (%v); treating as first sync", dir, err)
+			// A server that answers a missing file with the generic
+			// SSH_FX_FAILURE would otherwise warn on every first sync, which
+			// is the one run where no manifest is the expected state. Asking
+			// costs a round-trip only when the open already failed.
+			absent, aerr := remoteAbsent(client, manifestPath, nil)
+			if aerr != nil {
+				return empty, aerr
+			}
+			if !absent {
+				log.Warningf("could not open sync manifest in %s (%v); treating as first sync", dir, err)
+			}
 		}
 		return empty, nil
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, maxManifestBytes+1))
 	if err != nil {
 		if isConnError(err) {
 			return empty, err
@@ -253,10 +307,24 @@ func readManifest(client *sftp.Client, dir, name string, log Logger) (manifest, 
 		log.Warningf("could not read sync manifest in %s (%v); treating as first sync", dir, err)
 		return empty, nil
 	}
+	if int64(len(data)) > maxManifestBytes {
+		log.Warningf("sync manifest in %s is larger than %s; treating as first sync (nothing will be deleted this run)", dir, HumanSize(maxManifestBytes))
+		return empty, nil
+	}
 
-	var v2 manifest
-	if err := json.Unmarshal(data, &v2); err == nil && v2.Files != nil {
-		return v2, nil
+	var m manifest
+	if err := json.Unmarshal(data, &m); err == nil && m.Files != nil {
+		if m.Version < 3 {
+			// A v2 manifest recorded mtimes in whole seconds. Zero them so
+			// the fast path in hashPlanFiles never takes a second-resolution
+			// value for a nanosecond one; the hashes stay valid, only the
+			// one-time full re-hash is paid (exactly like the v1 upgrade).
+			for rel, e := range m.Files {
+				e.MTime = 0
+				m.Files[rel] = e
+			}
+		}
+		return confineManifest(m, dir, log), nil
 	}
 
 	var v1 struct {
@@ -268,11 +336,36 @@ func readManifest(client *sftp.Client, dir, name string, log Logger) (manifest, 
 		for rel, hash := range v1.Files {
 			files[rel] = manifestEntry{Hash: hash}
 		}
-		return manifest{Version: v1.Version, Files: files}, nil
+		return confineManifest(manifest{Version: v1.Version, Files: files}, dir, log), nil
 	}
 
 	log.Warningf("sync manifest in %s is unreadable; treating as first sync", dir)
 	return empty, nil
+}
+
+// confineManifest drops every entry whose key would not stay under dir. The
+// keys easySFTP writes are always plain relative slash paths, so a key that is
+// absolute or climbs out was not written by a run of this action; deleting
+// what it points at would hand whoever put it there the deploy account's whole
+// reach. Dropping is the right degradation: the file it named is simply not
+// deleted, and the next successful sync rewrites the manifest from the local
+// tree without it. See issue #223.
+func confineManifest(m manifest, dir string, log Logger) manifest {
+	var dropped []string
+	for rel := range m.Files {
+		if _, err := safeJoin(dir, rel); err != nil {
+			dropped = append(dropped, rel)
+		}
+	}
+	if len(dropped) == 0 {
+		return m
+	}
+	sort.Strings(dropped)
+	for _, rel := range dropped {
+		delete(m.Files, rel)
+	}
+	log.Warningf("sync manifest in %s has %d entry/entries that point outside the deployment (first: %q); ignoring them", dir, len(dropped), dropped[0])
+	return m
 }
 
 // writeManifest atomically writes the manifest into dir under name.
@@ -301,7 +394,7 @@ func writeManifest(client *sftp.Client, dir, name string, m manifest) error {
 // deepest first, walking up to (but not including) base. Each removal runs
 // through sess.do: the outcome stays best-effort, but a dropped connection is
 // redialed rather than silently failing every remaining removal.
-func pruneEmptyDirs(ctx context.Context, sess *session, watch *stallWatchdog, base string, deleted []string) {
+func pruneEmptyDirs(ctx context.Context, cfg *config.Config, sess *session, watch *stallWatchdog, base string, deleted []string, budget *deleteBudget) int {
 	seen := map[string]struct{}{}
 	var candidates []string
 	for _, f := range deleted {
@@ -313,13 +406,8 @@ func pruneEmptyDirs(ctx context.Context, sess *session, watch *stallWatchdog, ba
 			candidates = append(candidates, dir)
 		}
 	}
-	// Deepest paths sort last; remove them first so parents can then empty out.
-	sort.Sort(sort.Reverse(sort.StringSlice(candidates)))
-	for _, dir := range candidates {
-		_ = sess.do(ctx, watch, func(client *sftp.Client) error {
-			return client.RemoveDirectory(dir)
-		})
-	}
+	defer metrics.Phase("prune_dirs")()
+	return removeRemoteDirs(ctx, cfg, sess, watch, candidates, budget)
 }
 
 // hashFile returns the sha256 hex digest of a local file's contents.

@@ -7,6 +7,9 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/eiserv/easySFTP/internal/config"
+	"github.com/eiserv/easySFTP/internal/metrics"
 )
 
 // tmpSuffix is appended to the remote path while a file is still uploading.
@@ -21,12 +25,29 @@ import (
 // rename stays on one filesystem and is atomic.
 const tmpSuffix = ".easysftp-tmp"
 
-// transferEnv carries the run-wide invariants that every level of the upload
-// call chain re-threads to the next (the session, the stall watchdog, the
-// logger and the two warn-once flags). It is built once in uploadFiles and
-// passed down, so per-file positions stay short and, in particular, the two
-// adjacent *atomic.Bool flags can no longer be transposed at a call site: they
-// are named struct fields instead of interchangeable positional arguments.
+func uploadTempPath(remotePath string, index int) string {
+	return fmt.Sprintf("%s%s.%d", remotePath, tmpSuffix, index)
+}
+
+// bakSuffix names the short-lived copy of the live file that the non-atomic
+// publish path parks the target under while it renames the upload into place.
+// It sits inside the tmpSuffix family on purpose, so isTempFileName recognises
+// it and the stale-temp sweep collects one that an interrupted run left
+// behind. See renameReplaceViaBackup.
+const bakSuffix = tmpSuffix + ".bak"
+
+// transferEnv carries the invariants that every level of the upload call chain
+// re-threads to the next (the session, the stall watchdog, the logger and the
+// two warn-once flags). It is built once in uploadFiles and passed down, so
+// per-file positions stay short and, in particular, the two adjacent
+// *atomic.Bool flags can no longer be transposed at a call site: they are
+// named struct fields instead of interchangeable positional arguments.
+//
+// uploadFiles runs once per deployment, so the two warn-once flags are scoped
+// to a deployment, not to the whole run: a multi-deployment run against a
+// server that rejects SETSTAT warns once per affected deployment, which is
+// what tells the user how far the problem reaches. The warning texts say so
+// (see issue #121).
 type transferEnv struct {
 	cfg   *config.Config
 	sess  *session
@@ -38,6 +59,10 @@ type transferEnv struct {
 	modeWarned *atomic.Bool
 	// timesWarned doubles as the preserve-times switch: nil means off.
 	timesWarned *atomic.Bool
+	// progress is what stage 3 of the auto policy watches. It is nil when
+	// there is nothing to tune (every setting pinned, or a dry run), and
+	// every method on it tolerates that.
+	progress *uploadProgress
 }
 
 // uploadFiles creates the needed remote directories and uploads files in
@@ -46,31 +71,62 @@ type transferEnv struct {
 // same size is skipped instead of uploaded; the stat happens inside the
 // parallel workers so its latency is amortized by the concurrency.
 //
+// planned is the deployment's full plan, which is the same slice as files for
+// overlay and clean but a superset of it for sync (which narrows the upload to
+// the changed files). Only the stale-temp sweep needs the difference: the
+// directories it visits are the deployment's full planned directory set, and
+// the targets it must not remove are every planned one. See sweepStaleTemps
+// and issues #186 and #244.
+//
 // It returns which files completed, indexed like files, so that on a partial
 // failure the caller knows what actually made it to the server (the sync
 // strategy uses this to persist a recovery manifest).
-func uploadFiles(ctx context.Context, cfg *config.Config, sess *session, files []fileItem, dirs []string, stats *Stats, verb string, watch *stallWatchdog, skipUnchanged bool, log Logger) ([]bool, error) {
+func uploadFiles(ctx context.Context, cfg *config.Config, sess *session, files, planned []fileItem, dirs, sweepDirs []string, base string, stats *Stats, verb string, watch *stallWatchdog, skipUnchanged bool, log Logger) ([]bool, error) {
 	// Declared before the first failure point: callers index the returned
 	// slice by file, so it must be sized even when nothing was uploaded.
 	completed := make([]bool, len(files))
 	skipped := make([]bool, len(files))
 
 	if !cfg.DryRun {
-		// Through sess.do so a connection drop during directory setup redials
-		// instead of failing the run; MkdirAll and chmod are idempotent, so
-		// rerunning the whole pass on a fresh client is safe.
-		err := sess.do(ctx, watch, func(client *sftp.Client) error {
-			return createRemoteDirs(client, dirs, cfg.DirMode, watch, log)
-		})
+		// Each idempotent operation has its own sess.do retry scope, so a
+		// connection drop does not replay directories that already completed.
+		endDirs := metrics.Phase("create_dirs")
+		err := createRemoteDirs(ctx, sess, dirs, cfg.DirMode, watch, log)
+		endDirs()
 		if err != nil {
 			return completed, err
 		}
+
+		// Before any upload starts, remove temp files that an earlier killed
+		// run left anywhere in the deployment's planned directory tree; see
+		// sweepStaleTemps.
+		endSweep := metrics.Phase("sweep_stale_temps")
+		sweepStaleTemps(ctx, sess, watch, base, sweepDirs, planned, log)
+		endSweep()
 	}
 
+	defer metrics.Phase("upload")()
+
+	// Stages 1 and 2 of the auto policy, for this deployment: the workload is
+	// the transfer that is about to start (for sync, the changed set the
+	// manifest just produced), and the link is what the first connection
+	// measured. Everything the configuration pinned comes back unchanged.
+	work := uploadWorkload(files, skipUnchanged)
+	settings := sess.tune.planFor(work)
+	sess.setSpread(settings.Connections)
+	logTuning(cfg, sess, files, skipUnchanged, settings, log)
+
+	uploadStart := time.Now()
 	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(cfg.Concurrency)
+	g.SetLimit(settings.Concurrency)
 	results := make([]int64, len(files))
 	env := &transferEnv{cfg: cfg, sess: sess, watch: watch, log: log}
+	if sess.tune.adaptive() && !cfg.DryRun && len(files) > 0 {
+		// Stage 3. A dry run moves no bytes, so there is nothing to measure
+		// and nothing a wider pool could carry.
+		env.progress = newUploadProgress(files)
+		defer startTuningController(ctx, sess, work, settings, env.progress, log)()
+	}
 	// modeWarned is only armed when file-mode is an explicit override: a
 	// mirrored local mode (the default) stays silent on failure, as before.
 	if cfg.FileMode != nil {
@@ -78,7 +134,8 @@ func uploadFiles(ctx context.Context, cfg *config.Config, sess *session, files [
 	}
 	// timesWarned doubles as the preserve-times switch: nil means off. The
 	// user explicitly asked for preserved times, so a refusing server warns
-	// (once per run); staying silent would defeat the point of the input.
+	// (once per deployment); staying silent would defeat the point of the
+	// input.
 	if cfg.PreserveTimes {
 		env.timesWarned = new(atomic.Bool)
 	}
@@ -91,17 +148,21 @@ func uploadFiles(ctx context.Context, cfg *config.Config, sess *session, files [
 			// The stat is read-only, so it also runs in dry-run mode: the
 			// preview then reports the same skips the real run would.
 			if skipUnchanged {
-				client, _ := sess.current()
-				if fi, err := client.Stat(f.remotePath); err == nil && fi.Mode().IsRegular() && fi.Size() == f.size {
+				client, _, _ := sess.acquire(i)
+				done := metrics.Op("sftp_stat")
+				fi, err := client.Stat(f.remotePath)
+				done(err)
+				if err == nil && fi.Mode().IsRegular() && fi.Size() == f.size {
 					if cfg.LogPerFile() {
 						log.Infof("%sskip %s (remote file has the same size)", verb, f.remotePath)
 					}
 					skipped[i] = true
+					env.progress.skip(f.size)
 					return nil
 				}
 			}
 			if cfg.LogPerFile() {
-				log.Infof("%supload %s => %s (%s)", verb, f.localPath, f.remotePath, humanSize(f.size))
+				log.Infof("%supload %s => %s (%s)", verb, f.localPath, f.remotePath, HumanSize(f.size))
 			}
 			if cfg.DryRun {
 				// Report the planned byte count so bytes-uploaded matches the
@@ -120,10 +181,13 @@ func uploadFiles(ctx context.Context, cfg *config.Config, sess *session, files [
 			}
 			results[i] = n
 			completed[i] = true
+			env.progress.upload(n, f.size)
 			return nil
 		})
 	}
 	runErr := g.Wait()
+	var sent int64
+	var sentFiles int
 	for i, n := range results {
 		switch {
 		case skipped[i]:
@@ -131,7 +195,18 @@ func uploadFiles(ctx context.Context, cfg *config.Config, sess *session, files [
 		case completed[i]:
 			stats.FilesUploaded++
 			stats.BytesUploaded += n
+			sent += n
+			sentFiles++
 		}
+	}
+	if !cfg.DryRun {
+		// What this phase turned out to achieve, which is the one input the
+		// policy could not have before it started. It is kept for the *next*
+		// run (internal/autocache); within this one the controller has already
+		// acted on its own windows. A dry run moved no bytes and is skipped
+		// above: its results hold planned sizes, not transferred ones.
+		streams := min(sess.currentSpread(), settings.Concurrency, sentFiles)
+		sess.tune.observe(work, sent, time.Since(uploadStart), streams)
 	}
 	return completed, runErr
 }
@@ -158,8 +233,14 @@ func uploadFile(ctx context.Context, env *transferEnv, f fileItem, index int, mo
 	// The index makes the temp path unique per planned transfer, so it can't
 	// collide with another planned file whose real name is this one's plus
 	// tmpSuffix (see issue #42).
-	tmpPath := fmt.Sprintf("%s%s.%d", f.remotePath, tmpSuffix, index)
+	//
+	// The four round-trips below (open, write, chmod, rename) are sampled
+	// separately: in the small-file scenario the payload is a rounding error
+	// and the question is which of them the run is really spending its time in.
+	tmpPath := uploadTempPath(f.remotePath, index)
+	doneOpen := metrics.Op("sftp_open")
 	dst, err := client.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	doneOpen(err)
 	if err != nil {
 		return 0, err
 	}
@@ -168,12 +249,15 @@ func uploadFile(ctx context.Context, env *transferEnv, f fileItem, index int, mo
 	// instead of streaming a whole large file first.
 	var reader io.Reader = &ctxReader{ctx: ctx, r: src}
 	if watch != nil {
-		reader = watch.reader(reader)
+		reader = watch.writeProgress(reader)
 	}
+	doneWrite := metrics.Op("sftp_write")
 	n, err := io.Copy(dst, reader)
 	if cerr := dst.Close(); err == nil {
 		err = cerr
 	}
+	doneWrite(err)
+	metrics.Count("local_read_bytes", n)
 	if err != nil {
 		cleanupTmp(client, tmpPath, log)
 		return n, err
@@ -181,45 +265,157 @@ func uploadFile(ctx context.Context, env *transferEnv, f fileItem, index int, mo
 
 	// Best effort: mirrors the local permission bits, or the file-mode
 	// override when set. Some servers reject SETSTAT; an explicit override
-	// warns once per run so the user knows it isn't taking effect, but a
-	// mirrored local mode stays silent as before.
-	if cerr := client.Chmod(tmpPath, mode); cerr != nil && env.modeWarned != nil && !env.modeWarned.Swap(true) {
-		log.Warningf("could not set file-mode %04o on %s (server may reject SETSTAT); not warning again this run: %v", mode, f.remotePath, cerr)
+	// warns once per deployment so the user knows it isn't taking effect, but
+	// a mirrored local mode stays silent as before.
+	doneChmod := metrics.Op("sftp_chmod")
+	cerr := client.Chmod(tmpPath, mode)
+	doneChmod(cerr)
+	if cerr != nil && env.modeWarned != nil && !env.modeWarned.Swap(true) {
+		log.Warningf("could not set file-mode %04o on %s (server may reject SETSTAT); not warning again for this deployment: %v", mode, f.remotePath, cerr)
 	}
 
-	if err := renameReplace(client, tmpPath, f.remotePath); err != nil {
+	doneRename := metrics.Op("sftp_rename")
+	rerr := renameReplace(client, tmpPath, f.remotePath)
+	doneRename(rerr)
+	if rerr != nil {
 		cleanupTmp(client, tmpPath, log)
-		return n, fmt.Errorf("replacing %q: %w", f.remotePath, err)
+		return n, fmt.Errorf("replacing %q: %w", f.remotePath, rerr)
 	}
 
 	// preserve-times (timesWarned non-nil): keep the local modification time
 	// instead of "now". After the rename, so the request targets the final
-	// path; a failure warns once per run and never fails the deploy.
+	// path; a failure warns once per deployment and never fails the deploy.
+	// f.mtime is unix nanoseconds; the SFTP SETSTAT request carries whole
+	// seconds, so the sub-second part is truncated on the wire either way.
 	if env.timesWarned != nil {
-		mtime := time.Unix(f.mtime, 0)
-		if cerr := client.Chtimes(f.remotePath, mtime, mtime); cerr != nil && !env.timesWarned.Swap(true) {
-			log.Warningf("could not preserve the modification time on %s (server may reject SETSTAT); not warning again this run: %v", f.remotePath, cerr)
+		mtime := time.Unix(0, f.mtime)
+		doneTimes := metrics.Op("sftp_chtimes")
+		cerr := client.Chtimes(f.remotePath, mtime, mtime)
+		doneTimes(cerr)
+		if cerr != nil && !env.timesWarned.Swap(true) {
+			log.Warningf("could not preserve the modification time on %s (server may reject SETSTAT); not warning again for this deployment: %v", f.remotePath, cerr)
 		}
 	}
 	return n, nil
 }
 
+// posixRenameExt is the OpenSSH extension that makes a rename replace an
+// existing target atomically. Servers announce the extensions they implement
+// in their SSH_FXP_VERSION packet, which pkg/sftp records per connection.
+const posixRenameExt = "posix-rename@openssh.com"
+
 // renameReplace atomically moves tmp onto final. It prefers the
 // posix-rename@openssh.com extension (a true atomic overwrite) and falls back
-// to a plain remove+rename for servers that do not support it.
+// to renameReplaceViaBackup for servers that do not support it.
 func renameReplace(client *sftp.Client, tmp, final string) error {
 	err := client.PosixRename(tmp, final)
 	if err == nil {
 		return nil
 	}
-	var se *sftp.StatusError
-	if !errors.As(err, &se) || se.FxCode() != sftp.ErrSSHFxOpUnsupported {
+	_, announced := client.HasExtension(posixRenameExt)
+	if !posixRenameUnsupported(err, announced) {
 		return err
 	}
-	// note: non-atomic fallback, a brief window where final is missing.
-	// Only reached on servers lacking posix-rename; unavoidable there.
-	_ = client.Remove(final)
-	return client.Rename(tmp, final)
+	return renameReplaceViaBackup(client, tmp, final)
+}
+
+// renameReplaceViaBackup publishes tmp over final on a server that does not
+// implement posix-rename, without ever being in a state where the live file is
+// gone and nothing has replaced it.
+//
+// The obvious spelling, remove(final) then rename(tmp, final), has a window
+// that is not the one the comment here used to claim was unavoidable. A window
+// where final is briefly *missing* is unavoidable without the extension. A
+// window where final is *lost* is not: if the remove succeeds and the rename
+// then fails, the live file is gone, the replacement is not there, and the
+// error returned is the rename's. The causes of that second failure are
+// ordinary rather than exotic (the filesystem filled up between the two calls,
+// a quota was hit, the directory's permissions changed, the connection
+// dropped, another process took the name), and they are most likely on exactly
+// the appliance, embedded and managed-hosting servers this path exists for.
+//
+// So: park the live file under a backup name, move the upload into place, drop
+// the backup. The window where final is missing shrinks to a single rename,
+// and a failure at any step leaves the original content reachable. See
+// issue #242.
+func renameReplaceViaBackup(client *sftp.Client, tmp, final string) error {
+	backup := final + bakSuffix
+
+	// A backup an interrupted run left behind would make the park below fail
+	// on a server whose rename refuses an existing target, which is the same
+	// class of server that brought us here. Removing it is best effort: if it
+	// is still there afterwards the park fails and nothing has been touched.
+	_ = client.Remove(backup)
+
+	parked := false
+	switch err := client.Rename(final, backup); {
+	case err == nil:
+		parked = true
+	case errors.Is(err, os.ErrNotExist):
+		// Nothing live to protect: this is the first upload of this path.
+	default:
+		// A server answering "not there" with a generic status code looks the
+		// same as one refusing the rename, so ask it directly (issue #152).
+		// Anything that is not absence is a refusal, and a refusal must not
+		// cost the live file.
+		absent, aerr := remoteAbsent(client, final, nil)
+		if aerr != nil {
+			return aerr
+		}
+		if !absent {
+			return fmt.Errorf("could not move the existing file aside: %w", err)
+		}
+	}
+
+	if err := client.Rename(tmp, final); err != nil {
+		if !parked {
+			return err
+		}
+		if rerr := client.Rename(backup, final); rerr != nil {
+			return fmt.Errorf("%w; restoring the previous file from %s also failed: %v", err, backup, rerr)
+		}
+		return err
+	}
+
+	// Best effort. A leftover backup is swept by sweepStaleTemps once it is
+	// old enough, which is why bakSuffix lives in the tmpSuffix family.
+	_ = client.Remove(backup)
+	return nil
+}
+
+// posixRenameUnsupported reports whether a failed posix-rename@openssh.com
+// request means "this server does not implement the extension" rather than
+// "the server refused this particular rename". Only the first justifies the
+// non-atomic remove+rename fallback: falling back on a refusal would remove a
+// live file the server was never going to let us replace (issue #152).
+//
+// SSH_FX_OP_UNSUPPORTED is the answer the protocol asks for, and OpenSSH gives
+// it. Other implementations answer an unknown extended request with the
+// generic SSH_FX_FAILURE (or, when they reject the packet itself,
+// SSH_FX_BAD_MESSAGE), which on its own is indistinguishable from a policy or
+// permission rejection. The server's own extension announcement breaks the
+// tie: a server that never announced posix-rename was never asked a question
+// it advertised being able to answer, so a generic failure there is the
+// extension missing. A server that did announce it and then fails generically
+// is refusing the rename, and that error is returned unchanged.
+//
+// Codes the client library translates away (SSH_FX_NO_SUCH_FILE and
+// SSH_FX_PERMISSION_DENIED become os.ErrNotExist / os.ErrPermission and carry
+// no *sftp.StatusError) therefore never reach the fallback either, which is
+// what we want: both name a rename the server understood and declined.
+func posixRenameUnsupported(err error, announced bool) bool {
+	var se *sftp.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.FxCode() {
+	case sftp.ErrSSHFxOpUnsupported:
+		return true
+	case sftp.ErrSSHFxFailure, sftp.ErrSSHFxBadMessage:
+		return !announced
+	default:
+		return false
+	}
 }
 
 // cleanupTmp best-effort removes a leftover temp file, warning (but not
@@ -228,6 +424,167 @@ func cleanupTmp(client *sftp.Client, tmpPath string, log Logger) {
 	if err := client.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Warningf("could not remove temporary file %s: %v", tmpPath, err)
 	}
+}
+
+// staleTempMaxAge is how old (by remote modification time) a leftover temp
+// upload file must be before sweepStaleTemps removes it. Concurrent deploys
+// to one target are unsupported, but a sweep that deleted another live run's
+// in-progress temp file would turn that race into a corrupted deploy; the
+// age margin keeps any plausibly-live temp file safe without locking. A
+// variable only so tests can shrink it.
+var staleTempMaxAge = time.Hour
+
+// isTempFileName reports whether name looks like a temporary upload file this
+// action writes: "<name>.easysftp-tmp.<n>" for a file upload (n being the
+// plan index, see uploadFile), "<name>.easysftp-tmp" for a manifest write
+// (see writeManifest), or "<name>.easysftp-tmp.bak" for the copy the
+// non-atomic publish path parks a live file under (see
+// renameReplaceViaBackup). The suffix is always appended to an existing name,
+// so a file named exactly ".easysftp-tmp" (i == 0) is not one of ours.
+func isTempFileName(name string) bool {
+	i := strings.LastIndex(name, tmpSuffix)
+	if i <= 0 {
+		return false
+	}
+	rest := name[i+len(tmpSuffix):]
+	if rest == "" || rest == ".bak" {
+		return true
+	}
+	if rest[0] != '.' || len(rest) < 2 {
+		return false
+	}
+	for _, c := range rest[1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// sweepStaleTemps removes temp upload files that an earlier killed run left
+// behind (issue #160). Every in-process failure path already cleans its temp
+// file up, but SIGKILL, a cancelled workflow past its grace period or a
+// reclaimed runner skip all deferred code, and neither overlay nor sync ever
+// deletes a file it did not just write, so the orphans would otherwise sit in
+// the target forever, publicly served when the target is a web root.
+//
+// The swept set is the deployment's full planned directory tree plus its
+// remote base, where the sync manifest's temp file lives even when no changed
+// file does. This deliberately reaches a directory whose files are unchanged:
+// otherwise debris from an interrupted run stays there forever. Nothing above
+// the base is ever listed or touched: a deploy to /var/www/html/blog has no
+// business reading /var. The extra listings buy complete cleanup inside the
+// tree and remain bounded by the plan.
+//
+// Three guards bound what the sweep may remove: the name must match the temp
+// pattern (isTempFileName), the entry must be older than staleTempMaxAge (a
+// younger one is plausibly another live run's in-progress upload), and it
+// must not be a planned target of this run (a real deployed file can be named
+// like a temp file; see the literal-name test in atomic_test.go). That third
+// guard reads the deployment's *full* plan, not the subset being uploaded:
+// under sync an unchanged file is absent from the upload subset, and sweeping
+// it would delete it silently and for good, because the manifest still records
+// it as up to date and no later run would restore it (issue #186). Staleness
+// compares the runner's clock against the mtime the server reports
+// (time.Since of the entry's ModTime), so a server clock running behind the
+// runner's can make a fresh temp file look older than it is; concurrent
+// deploys to one target are unsupported anyway, so such skew weakens a
+// mitigation rather than creating a new hazard.
+//
+// The sweep deliberately runs for every strategy, the non-destructive overlay
+// included, and has no opt-out: it only ever removes this action's own
+// "*.easysftp-tmp" and "*.easysftp-tmp.<n>" debris, never a file it did not
+// name itself. For the same reason its removals deliberately do not count
+// against safety.max_deletes (which budgets deletions of deployed files) and
+// are not reported in the run's delete stats.
+//
+// Everything is best-effort: directories run concurrently through the
+// session's bounded worker pool, with each one in its own sess.do so a dropped
+// connection redials. A listing or removal failure only warns and never fails
+// the deploy. Removals are logged, so a user who wondered what those files were
+// gets an answer.
+func sweepStaleTemps(ctx context.Context, sess *session, watch *stallWatchdog, base string, plannedDirs []string, planned []fileItem, log Logger) {
+	keep := make(map[string]struct{}, len(planned))
+	for _, f := range planned {
+		keep[f.remotePath] = struct{}{}
+	}
+	touched := make(map[string]struct{}, len(plannedDirs)+1)
+	// A single-file overlay deploy without a trailing slash resolves base to
+	// the planned file itself, not a directory; its parent joins the set via
+	// path.Dir below, so the file path is skipped here.
+	sweepBase := base
+	if _, isPlannedFile := keep[base]; isPlannedFile {
+		sweepBase = path.Dir(base)
+	}
+	touched[sweepBase] = struct{}{}
+	for _, dir := range plannedDirs {
+		if dir == sweepBase || strings.HasPrefix(dir, strings.TrimSuffix(sweepBase, "/")+"/") {
+			touched[dir] = struct{}{}
+		}
+	}
+	dirs := make([]string, 0, len(touched))
+	for dir := range touched {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	_ = runBounded(ctx, sess.workers(len(dirs)), len(dirs), func(groupCtx context.Context, i int) error {
+		_ = sess.do(groupCtx, watch, func(client *sftp.Client) error {
+			return sweepDirStaleTemps(client, dirs[i], keep, watch, log)
+		})
+		return nil
+	})
+}
+
+// sweepDirStaleTemps sweeps a single remote directory; see sweepStaleTemps.
+// Connection-class errors are returned so sess.do redials and reruns the
+// directory (removals are idempotent); anything else is swallowed after a
+// warning.
+func sweepDirStaleTemps(client *sftp.Client, dir string, keep map[string]struct{}, watch *stallWatchdog, log Logger) error {
+	doneList := metrics.Op("sftp_readdir")
+	entries, err := client.ReadDir(dir)
+	doneList(err)
+	if err != nil {
+		if isConnError(err) {
+			return err
+		}
+		// Best-effort: a directory that cannot be listed is left alone. Not
+		// worth a warning; the run itself has not lost anything.
+		return nil
+	}
+	watch.tick()
+	for _, e := range entries {
+		if e.IsDir() || !isTempFileName(e.Name()) {
+			continue
+		}
+		if time.Since(e.ModTime()) < staleTempMaxAge {
+			continue
+		}
+		// Names come from the server; a temp-looking one that points out of
+		// the directory it was listed from is not swept (issue #223).
+		full, err := safeChild(dir, e.Name())
+		if err != nil {
+			log.Warningf("skipping remote entry while sweeping %s: %v", dir, err)
+			continue
+		}
+		if _, ok := keep[full]; ok {
+			continue
+		}
+		done := metrics.Op("sftp_remove")
+		err = client.Remove(full)
+		done(err)
+		if err != nil {
+			if isConnError(err) {
+				return err
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				log.Warningf("could not remove stale temporary file %s: %v", full, err)
+			}
+			continue
+		}
+		log.Infof("removed stale temporary file %s (left behind by an earlier interrupted run)", full)
+		watch.tick()
+	}
+	return nil
 }
 
 // ctxReader makes an io.Copy abort as soon as the context is cancelled.

@@ -17,7 +17,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -28,9 +28,35 @@ jobs:
         if: runner.os == 'Linux'
         run: shellcheck scripts/*.sh
 
+      # AGENTS.md and CLAUDE.md were two copies of the same working notes and
+      # drifted by 179 lines before anyone noticed (issue #231). AGENTS.md is a
+      # pointer now, and this keeps it one: a file that grows back into a
+      # duplicate is a file that will silently go stale again.
+      - name: AGENTS.md is a pointer, not a copy
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          lines=$(wc -l < AGENTS.md)
+          if [ "$lines" -gt 40 ]; then
+            echo "::error file=AGENTS.md::AGENTS.md is $lines lines. It must stay a pointer to CLAUDE.md, not a second copy of the working notes (issue #231)."
+            exit 1
+          fi
+          if ! grep -q 'CLAUDE.md' AGENTS.md; then
+            echo "::error file=AGENTS.md::AGENTS.md must point at CLAUDE.md."
+            exit 1
+          fi
+
       - name: Test action launcher modes and validation
         shell: bash
         run: bash scripts/test-action.sh
+
+      # The benchmark harness used to be checked here by two shell self-tests.
+      # It is Go now (issue #190), so its self-checks are ordinary tests in the
+      # job below: internal/benchmark/driver drives both measuring loops end to
+      # end against a stub binary, and internal/benchmark/store covers the
+      # retention window and the storage invariants. The container job further
+      # down still covers the other half, that a real easySFTP run produces the
+      # metrics all of this aggregates.
 
       - name: Validate action metadata
         run: go test ./internal/actionmeta
@@ -43,7 +69,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -63,18 +89,92 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...
+
       - name: Test
         run: go test -race ./...
+
+  # The optional Python analysis layer (benchmarks/analysis/) has self-checks
+  # of its own, and nothing here ran them per pull request: the only place they
+  # ran was once per release, when the figures are drawn (benchmark-analysis.yml,
+  # PR #206), so a change that broke plot.py or benchdata.py stayed green until
+  # the next release. They load every result committed under benchmarks/, which
+  # makes this also the place where a stored document the analysis layer cannot
+  # read surfaces: on the day it is stored, not on the day someone needs the
+  # picture.
+  analysis-tests:
+    name: Benchmark analysis self-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Two commits is all the scope check below needs: on a pull request
+          # the checked-out commit is the merge commit, whose first parent is
+          # the base branch.
+          fetch-depth: 2
+
+      # A path filter, but a job-level one, because "on: pull_request: paths:"
+      # would gate the whole workflow. The job itself always runs and always
+      # reports, so it can be a required check; only the install and the checks
+      # are skipped. Anything undecidable runs the checks: a scope test that
+      # silently skips is worse than one that spends a minute.
+      - name: Decide whether this run touches the analysis layer
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -uo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "Not a pull request; running the self-checks."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! changed=$(git diff --name-only HEAD^1 HEAD 2>/dev/null); then
+            echo "Could not diff against the base; running the self-checks."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if printf '%s\n' "$changed" | grep -Eq '^(benchmarks/|\.github/workflows/ci\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing under benchmarks/ changed; skipping the self-checks."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: steps.scope.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: benchmarks/analysis/requirements.txt
+
+      # matplotlib is the only dependency, pinned there so a plot made today
+      # can be remade next year.
+      - name: Install the analysis dependencies
+        if: steps.scope.outputs.run == 'true'
+        run: pip install -r benchmarks/analysis/requirements.txt
+
+      - name: Run the analysis self-checks
+        if: steps.scope.outputs.run == 'true'
+        run: python -m unittest discover -s benchmarks/analysis
 
   self-test:
     name: Self-test against a real SFTP server
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Start SFTP server
+        # Pinned by digest, like every action in this repo: a mutable tag lets
+        # a retag (compromised or merely broken) flow straight into CI, and
+        # makes the self-test fail without a change here. Dependabot does not
+        # update inline "docker run" digests, so this is updated by hand with:
+        #   docker buildx imagetools inspect atmoz/sftp:alpine
         run: |
-          docker run -d --name sftp -p 2222:22 atmoz/sftp:alpine demo:demopass:::upload
+          docker run -d --name sftp -p 2222:22 atmoz/sftp@sha256:a6cb3eb29202ca7f57e73bb7e527286e66e0e822fff65609207c7e0ef2d135a3 demo:demopass:::upload # atmoz/sftp:alpine
           for i in $(seq 1 30); do
             nc -z localhost 2222 && exit 0
             sleep 1
@@ -134,6 +234,7 @@ jobs:
           source: ./selftest-site/
           target: /upload/
           exclude: "*.log"
+          file-mode: "0640"
 
       - name: Verify upload
         run: |
@@ -141,6 +242,11 @@ jobs:
           docker exec sftp test -f /home/demo/upload/assets/style.css
           if docker exec sftp test -e /home/demo/upload/debug.log; then
             echo "::error::ignored file was uploaded"
+            exit 1
+          fi
+          mode=$(docker exec sftp stat -c '%a' /home/demo/upload/index.html)
+          if [ "$mode" != "640" ]; then
+            echo "::error::file-mode input was not applied (got $mode, want 640)"
             exit 1
           fi
           [ "${{ steps.upload.outputs.files-uploaded }}" = "2" ]
@@ -172,6 +278,32 @@ jobs:
           docker exec sftp test -f /home/demo/upload/index.html
           [ "${{ steps.clean-upload.outputs.files-deleted }}" -ge 1 ]
 
+      # The other clean-mode case: a target that does not exist yet, so the
+      # remote scan runs before there is anything to scan. Nothing to delete is
+      # the expected state of a first deployment, not a failure. Covered here
+      # because the unit tests reach it through a fake server; this is the same
+      # path against a real one (issue #152).
+      - name: Clean mode into a target that does not exist yet
+        id: fresh-clean
+        uses: ./
+        with:
+          host: localhost
+          port: 2222
+          username: demo
+          password: demopass
+          host-key: ${{ steps.hostkey.outputs.fingerprints }}
+          source: ./selftest-site/
+          target: /upload/fresh-clean/
+          exclude: "*.log"
+          mode: clean
+
+      - name: Verify the first clean deployment
+        run: |
+          docker exec sftp test -f /home/demo/upload/fresh-clean/index.html
+          docker exec sftp test -f /home/demo/upload/fresh-clean/assets/style.css
+          [ "${{ steps.fresh-clean.outputs.files-uploaded }}" = "2" ]
+          [ "${{ steps.fresh-clean.outputs.files-deleted }}" = "0" ]
+
       # config-mode end-to-end: unit tests set EASYSFTP_* variables directly
       # and never see action.yml's declared defaults; only a real composite
       # run does. This is how #62 (a declared default tripping the config
@@ -199,6 +331,8 @@ jobs:
             echo '    source: ./selftest-docs/'
             echo '    target: /upload/cfg-docs/'
             echo '    mode: clean'
+            echo 'advanced:'
+            echo '  auto_cache: selftest-cache/auto.json'
           } > selftest-config.yml
           cat selftest-config.yml
 
@@ -219,6 +353,37 @@ jobs:
             exit 1
           fi
           [ "${{ steps.cfgfile.outputs.files-uploaded }}" = "3" ]
+
+      # The auto-tuning cache (issue #212) end to end. Unit tests cover the
+      # record's rules against an in-process server that is a socket away and
+      # can therefore never produce a throughput; what only a real run can show
+      # is that the file is written at all, in a directory that did not exist,
+      # and that it carries the link the probe measured. A second deploy must
+      # update that one record rather than file another.
+      - name: Verify the auto-tuning cache was written
+        run: |
+          cat selftest-cache/auto.json
+          jq -e '.version == 1
+                 and (.records | length) == 1
+                 and .records[0].policy_version >= 1
+                 and .records[0].workload.files == 3
+                 and .records[0].link.rtt_ms > 0
+                 and .records[0].link.handshake_ms > 0
+                 and .records[0].settings.connections >= 1' selftest-cache/auto.json
+          # An atomic write leaves no debris next to the file; the whole
+          # directory is what a CI cache would carry between runs.
+          [ "$(ls selftest-cache | wc -l)" = "1" ]
+
+      - name: Deploy via config file again
+        uses: ./
+        with:
+          password: demopass
+          config: selftest-config.yml
+
+      - name: Verify the second run reused the same record
+        run: |
+          cat selftest-cache/auto.json
+          jq -e '(.records | length) == 1 and .records[0].workload.files == 3' selftest-cache/auto.json
 
       # sync round-trip against a real OpenSSH server: manifest written,
       # read back on the next run, deletions tracked, unchanged files skipped.
@@ -327,3 +492,126 @@ jobs:
           [ "${{ steps.badkey.outcome }}" = "failure" ]
           [ "${{ steps.nokey.outcome }}" = "failure" ]
           [ "${{ steps.v2input.outcome }}" = "failure" ]
+
+      # The benchmark harness (issue #169) normally runs against an external
+      # server behind secrets, so this container is the only place its
+      # plumbing can be exercised: binary invocation, step-output parsing and
+      # the JSON/Markdown aggregation. One repeat is enough to prove the
+      # pipeline; the numbers it produces are meaningless against localhost.
+      - name: Smoke-test the benchmark harness
+        env:
+          CANDIDATE_BIN: ${{ runner.temp }}/bench-bin/easysftp
+          CANDIDATE_REF: self-test
+          REPEATS: "1"
+          REMOTE_BASE: /upload/benchmark
+          OUT_DIR: ${{ runner.temp }}/bench-out
+          LOG_DIR: ${{ runner.temp }}/bench-logs
+          DATASET_DIR: ${{ runner.temp }}/bench-data
+          BENCH_HOST: localhost
+          BENCH_PORT: "2222"
+          BENCH_USERNAME: demo
+          BENCH_PASSWORD: demopass
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench-bin"
+          go build -o "$RUNNER_TEMP/bench-bin/easysftp" ./cmd/easysftp
+          go build -o "$RUNNER_TEMP/bench-bin/easysftp-bench" ./cmd/easysftp-bench
+          BENCH_KNOWN_HOSTS=$(ssh-keyscan -p 2222 localhost 2>/dev/null)
+          export BENCH_KNOWN_HOSTS
+          "$RUNNER_TEMP/bench-bin/easysftp-bench" standard
+          jq -e '.results | length == 3 and all(.files > 0 and .median_ms > 0 and .failed_runs == 0)' "$OUT_DIR/results.json"
+          test -s "$OUT_DIR/summary.md"
+          test -s "$OUT_DIR/results.csv"
+          # The instrumentation half: a real run must have produced phases, the
+          # per-round-trip operation samples and the process metrics. Asserted
+          # here because the stub-driven test above cannot prove that
+          # internal/metrics is wired into the upload path at all.
+          jq -e '.results[] | select(.label == "candidate" and .scenario == "small")
+                 | (.phases | map(.name) | index("upload")) != null
+                   and ((.operations | map(select(.name == "sftp_open")) | first | .count) == 300)
+                   and .process.max_rss_bytes > 0
+                   and .process.user_cpu_ms > 0
+                   and .process.net_write_bytes > 0' "$OUT_DIR/results.json"
+          # The adaptive settings (issues #209 and #215) against a real server,
+          # which is the only place the link probe and the connection pool run
+          # at all. The standard benchmark is an inline run, so all three
+          # settings are at auto: the policy must have read the workload
+          # including its shape, measured the link, left the throughput at the
+          # prior (nothing observes one before the first byte moves) and stayed
+          # inside its own bounds. auto_changes has to add up to the two
+          # directions, or a step back is being counted as a step forward.
+          jq -e '.results[] | select(.label == "candidate" and .scenario == "small")
+                 | (.operations | map(select(.name == "sftp_realpath")) | first | .count) >= 3
+                   and .counters.workload_files == 300
+                   and .counters.workload_probes == 0
+                   and .counters.workload_p50_bytes == 4096
+                   and .counters.workload_p90_bytes == 4096
+                   and .counters.workload_small_files == 300
+                   and .counters.link_rtt_us > 0
+                   and .counters.link_handshake_us > 0
+                   and .counters.link_stream_bytes_per_second == 0
+                   and .counters.auto_initial_connections >= 1
+                   and .counters.auto_final_connections >= 1
+                   and .counters.auto_changes == (.counters.auto_spread_increases + .counters.auto_spread_decreases)
+                   and .counters.config_connections >= .counters.auto_final_connections
+                   and .counters.config_connections >= .counters.auto_initial_connections
+                   and .counters.config_connections <= 8
+                   and .counters.config_concurrency == 64
+                   and .counters.config_request_concurrency == 16
+                   and .counters.connections_opened <= 8
+                   and ((.counters.connections_refused // 0) == 0)' "$OUT_DIR/results.json"
+
+      # A two-by-two grid of the matrix sweep: enough to prove the plumbing
+      # (config generation for both axes, per-cell aggregation, the CSV) without
+      # spending the self-test's minutes on a full sweep against a container
+      # whose numbers mean nothing anyway.
+      - name: Smoke-test the matrix benchmark
+        env:
+          CANDIDATE_BIN: ${{ runner.temp }}/bench-bin/easysftp
+          CANDIDATE_REF: self-test
+          REPEATS: "1"
+          MATRIX_CONNECTIONS: "1 2"
+          MATRIX_CONCURRENCY: "1 4"
+          MATRIX_SCENARIOS: "small single"
+          REMOTE_BASE: /upload/benchmark
+          OUT_DIR: ${{ runner.temp }}/matrix-out
+          LOG_DIR: ${{ runner.temp }}/matrix-logs
+          DATASET_DIR: ${{ runner.temp }}/bench-data
+          BENCH_HOST: localhost
+          BENCH_PORT: "2222"
+          BENCH_USERNAME: demo
+          BENCH_PASSWORD: demopass
+        run: |
+          BENCH_KNOWN_HOSTS=$(ssh-keyscan -p 2222 localhost 2>/dev/null)
+          export BENCH_KNOWN_HOSTS
+          "$RUNNER_TEMP/bench-bin/easysftp-bench" matrix
+          # 7, not 2x2x2: the grid is per scenario (issue #184, phase 5). "small"
+          # takes the whole 2x2, "single" is one file and therefore one
+          # connections/concurrency cell, swept over the three
+          # request_concurrency values it is the only scenario here to qualify for.
+          jq -e '.cells | length == 7 and all(.median_ms > 0 and .failed_runs == 0)' "$OUT_DIR/matrix.json"
+          # The request axis really reaches the run, and every cell records the
+          # value it ran with. Against a real server because the counter behind
+          # it is the only source of that; the stub can only echo it back.
+          jq -e '.cells | all(.request_concurrency_used > 0
+                   and (.request_concurrency == null
+                        or .request_concurrency == .request_concurrency_used))' "$OUT_DIR/matrix.json"
+          # And "auto" resolved to something real, per scenario, which is what
+          # the policy regret of issue #184 phase 5 is computed from.
+          jq -e '.auto | length == 2 and all(.median_ms > 0 and .failed_runs == 0
+                   and .chosen.connections > 0 and .chosen.concurrency > 0
+                   and .chosen.request_concurrency > 0 and .regret_percent != null)' "$OUT_DIR/matrix.json"
+          # connections > concurrency must be measured, not rejected, and the
+          # pool must really cap at the concurrency there (see the pool note in
+          # internal/uploader/session.go).
+          jq -e '[.cells[] | select(.connections == 2 and .concurrency == 1)]
+                 | length > 0 and all(.connections_used == 1)' "$OUT_DIR/matrix.json"
+          test -s "$OUT_DIR/matrix.csv"
+          test -s "$OUT_DIR/matrix.md"
+
+      - name: Verify the benchmark left nothing behind
+        run: |
+          if [ -n "$(docker exec sftp find /home/demo/upload/benchmark -type f)" ]; then
+            echo "::error::benchmark payload survived its own cleanup"
+            docker exec sftp find /home/demo/upload/benchmark
+            exit 1
+          fi

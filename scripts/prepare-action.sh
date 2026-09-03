@@ -46,6 +46,13 @@ if [[ "$mode" == 'prebuilt' ]]; then
   download_release_file "$version" 'checksums.txt' "$checksums" 1048576
   download_release_file "$version" "$asset" "$binary" 104857600
   verify_release_checksum "$binary" "$checksums" "$asset"
+  # The checksum proves the download was not corrupted in transit; the
+  # attestation is what proves the asset is the one this repository's release
+  # workflow built. See verify_release_provenance and issue #146.
+  # A full-SHA action ref adds one more invariant: the attested source commit
+  # must be the exact commit the user pinned, not merely some release built by
+  # the trusted workflow. release_commit is empty for tag refs.
+  verify_release_provenance "$binary" "$asset" "$version" "$release_commit"
   chmod +x "$binary"
   echo "Using verified easySFTP $version release asset $asset"
 else

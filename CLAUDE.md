@@ -8,6 +8,11 @@ Style note: avoid em-dashes in anything written here (code comments, error
 messages, docs, PR and issue text). Use a comma, semicolon, colon, or
 parentheses instead. The generated `CHANGELOG.md` is exempt. See issue #79.
 
+`AGENTS.md` is a pointer to this file, not a second copy: it used to be one and
+drifted 179 lines behind, still documenting a benchmark harness deleted in #190
+(issue #231). Everything an automated session needs goes here. `ci.yml` fails
+if `AGENTS.md` grows back into a duplicate.
+
 ## What this project is (and isn't)
 
 easySFTP is a GitHub Action for SFTP deploys: connect, plan, upload, optional
@@ -38,28 +43,201 @@ Guiding principles for changes here:
   (`internal/config/config_test.go`), which keeps config tests hermetic when
   the ambient environment sets `EASYSFTP_*` variables.
 
-## Two categories of settings
+## Where a setting lives (v3)
 
-Look at how existing inputs are wired before adding a new one:
+v3 replaced the old two-category split with one rule: **every non-secret
+setting has exactly one home.** Check `action.yml` before assuming an input
+exists; most v2 inputs are now "Removed in v3" stubs that only exist to
+produce a migration error (`internal/config/config.go` holds the list and its
+messages).
 
-1. **Deployment shape** (what/where/how to reconcile): `uploads`, `strategy`,
-   `ignore`, `ignore-from`, `max-deletes`. These are mutually exclusive with
-   `config-file` (see the check at the top of `config.Load()`) because a
-   YAML config file replaces them entirely, and `configfile.go` /
-   `schema/easysftp.schema.json` define the per-target equivalents.
+The complete v3 input surface is:
+
+1. **Inline mode**: `host`, `port`, `username`, `host-key`, `known-hosts`,
+   `allow-any-host-key`, `source`, `target`, `mode`, `exclude`, `file-mode`,
+   `dir-mode`, `preserve-times`. Setting any of these together with `config`
+   fails the run (the check at the top of `config.Load()`): there is no mixed
+   mode.
    **Never give these inputs a `default:` in `action.yml`**: the runner
    exports declared defaults unconditionally, so the mutual-exclusion check
-   sees them as "user-set" and rejects every `config-file` run; that's how
+   sees them as "user-set" and rejects every config-file run; that's how
    #62 shipped in v2.0.0. `TestLoadConfigFileWithActionDefaults`
    (`internal/config/config_test.go`) guards against reintroducing this.
-2. **Run-wide behavior** (connection, transfer mechanics): `retries`,
-   `concurrency`, `sftp-request-concurrency`, `timeout`, `stall-timeout`,
-   `dry-run`, `sync-fast-path`, `skip-unchanged`, `dir-mode`, `file-mode`.
-   These always come from action
-   inputs, regardless of `config-file`, and have **no** per-target override
-   and **no** YAML config-file equivalent. Don't add one unless a concrete
-   use case needs per-target granularity; it's easy to add later, hard to
-   remove once users depend on it.
+2. **Config mode**: `config`, pointing at a `version: 3` YAML file that owns
+   everything non-secret, including what used to be run-wide inputs
+   (`advanced.*`, `permissions.*`, `sync.*`, `safety.max_deletes`). Parsed in
+   `configfile.go`, validated by `schema/easysftp.schema.json`.
+3. **Valid in both modes**: credentials (`password`, `private-key`,
+   `passphrase`, `proxy-*` credentials) plus `dry-run` and `log-level`. These
+   change how a run authenticates or reports, never what it deploys.
+
+So a new knob is normally a config-file field, not an input. Adding it as an
+input means arguing why it belongs in category 1 or 3.
+
+`file-mode` / `dir-mode` / `preserve-times` are the worked example (issue
+#133): they are category 1, mirrored by `permissions.*` in category 2, so a
+Windows deploy that needs `file-mode: "0644"` does not have to convert its
+whole workflow into a config file. Each setting still has exactly one home
+*per mode*, which is what keeps "no precedence question" true. Per-deployment
+granularity is a separate, later decision; don't build it speculatively.
+
+## The adaptive transport settings (`auto`)
+
+`advanced.connections`, `advanced.concurrency` and `advanced.request_concurrency`
+default to `auto`, and since issue #209 `auto` is a real policy rather than a
+synonym for a fixed 1/4/16. `internal/autotune` is that policy: a cost model
+with no clock, no I/O and no state, plus a small runtime controller. Read its
+package comment before changing anything here; the short version:
+
+- `concurrency` is the number of independent items the phase has, capped at 64.
+  There is no trade-off (a worker with nothing to do never starts), which is
+  why nothing measures it and why the runtime controller never moves it.
+- `request_concurrency` follows the largest file (it counts 32 KiB write
+  packets in flight for *one* file) and is capped by the SSH channel window,
+  which is 64 packets. It is fixed when an SFTP client is created, so it is
+  resolved once, run-wide, before the first connection.
+- `connections` is the only interesting one. `T(k) = W/k + (k-1)*H` is smallest
+  at `k = sqrt(W/H)`: open another connection while it saves more than its
+  handshake costs. Everything else in the package exists to estimate `W`.
+
+Three rules that are load-bearing:
+
+1. **A number in the config file is never touched**, at any stage.
+   `config.AutoSettings` records which of the three the user left to easySFTP;
+   the int fields keep the old fixed defaults as a fallback. A `config.Config`
+   built directly (every uploader test) therefore has all three *pinned*, which
+   is why the pre-existing tests still measure what they measured.
+2. **The pool only grows.** `session.conns` is allocated once to the ceiling
+   and `session.spread` is what moves; slots are dialed on first use, so
+   widening costs nothing until a worker lands on a fresh slot. A refused
+   connection latches `session.refused`, pulls the spread back and stops the
+   run asking again.
+3. **Never derive parallelism from `runtime.NumCPU()`.** The constraint is the
+   server and the path, not the runner (issue #156 says so explicitly). The one
+   place the runner's CPU count belongs is sync hashing, which is local work
+   (issue #155).
+
+The three stages and where they run:
+
+| Stage | Where | What it adds |
+|---|---|---|
+| 1, workload | `uploader.Run` (run-wide) and `uploadFiles` (per deployment) | the plan: files, bytes, largest file, metadata round-trips |
+| 2, link | `newSession` via `probeLink` | the handshake it just paid, and an RTT from three `SSH_FXP_REALPATH` round-trips |
+| 3, runtime | `startTuningController` inside `uploadFiles` | the throughput the transfer is actually achieving |
+
+Stage 3 only reaches work that has not started (issue #217). A worker takes its
+connection in `session.acquire` when it picks up its file and keeps it for that
+file's whole transfer, so a spread change re-points the queue behind the workers
+and nothing else. Since `concurrency` is the item count capped at 64, a
+deployment of at most 64 files has no queue at all: `autotune.NewController`
+stops before a goroutine is started, `startTuningController` logs why at debug
+level, and stage 1 is the whole decision. That is also why `config_connections`
+(the spread the policy stood behind) and `connections_used` (the slots a file
+was really handed to) are different questions, and the benchmark's `auto[]`
+block records both.
+
+An overlay deployment with `advanced.skip_unchanged` is the case stage 1 cannot
+settle: the upload set is decided file by file while the run goes. It is
+planned as metadata only (`Workload.Unknown`), which is what keeps a redeploy
+that changed three files from paying for a pool, and stage 3 widens it if the
+observed ratio says most files really are being sent.
+
+`assumedStreamBytesPerSecond` is the one input the model cannot measure before
+it decides, and since issue #230 it is fitted like everything else here: 0.35
+MiB/s, just under the 0.36 to 0.39 MiB/s single-stream control the stored
+results record, replacing a 1 MiB/s guess that was 2.8x above it. `W` is divided
+by it, so a prior that is too high understates the work, understates
+`k = sqrt(W/H)` and opens too few connections. Replaying every stored sweep,
+worst-case regret falls from 24.4% to 14.4% and the whole 0.25 to 0.75 MiB/s
+range stays inside the 15% budget, so the number is not balanced on a knife
+edge. Carry the caveat with it: one host, one 13 ms path, `shaping.available`
+false in every stored result.
+
+The acceptance test issue #209 asks for is in two files, because the policy can
+be scored two ways and both are worth having.
+
+`internal/autotune/regret_test.go` **replays** the policy over every sweep
+committed under `benchmarks/matrix/` with at least three repeats and fails when
+the regret against the best measured cell goes over 15% (a gap under 300 ms
+passes on its absolute size, which is what the issue allows for sub-two-second
+runs). A choice the grid did not measure is interpolated between the cells that
+bracket it, not snapped to the nearest one: snapping broke ties upward, which
+is usually the faster column, so it flattered the policy by construction
+(issue #228). A sibling test asserts that the old fixed 1/4/16 would *fail* the
+replay, so it cannot quietly stop discriminating.
+
+`internal/autotune/recorded_regret_test.go` **reads what a sweep recorded about
+itself**: the `auto[]` block holds the regret the policy actually achieved on
+that host that day, with no replay and no interpolation in it. Every row is
+printed; a row is also enforced once the sweep has at least three repeats (below
+that its "best cell" is a sample, see issue #227) and today's policy still
+chooses the settings that row measured. Until a release sweep is stored at three
+repeats this half reports rather than gates, which is why the replay still
+carries the acceptance budget.
+
+**Changing a constant in `internal/autotune` means running both**, and a stored
+sweep that fails one means the policy needs refitting, not that the test needs
+relaxing.
+
+## Remembering a measurement between runs (`internal/autocache`)
+
+`advanced.auto_cache` names a local file where a run records what it measured
+about its server, so the next run plans from a measurement instead of from the
+prior. It is off unless the config file names a path, and it is the one place
+where a decision made in an earlier run can reach this one. Four rules keep
+that from turning into stale configuration (issue #212):
+
+1. **Settings are stored but never restored.** `autotune.Plan` is pure and
+   costs microseconds, so memoizing its output would save nothing and would
+   preserve an answer for a deploy that no longer exists. What a hit supplies
+   is an *input*: the per-connection throughput (as `autotune.SourceCached`,
+   which a runtime measurement of the transfer still outranks) and a
+   connection ceiling the cost model cannot derive, because it assumes perfect
+   scaling.
+2. **Records are anchored.** A record describes the workload its measurement
+   was taken on, and a run that only *uses* a record rewrites neither that
+   anchor nor the stored link; only a run that measures the link itself does
+   (`Store.Update`). Comparing each run against the one before it would hit
+   forever for a dataset that grows a per cent at a time, which is the failure
+   mode this whole package is shaped around.
+   `internal/autocache/drift_test.go` replays both readings over the same
+   sequence of deploys and is the acceptance test for it. The rule holds for
+   every record, including one whose measurement produced no throughput; that
+   used to be an exemption and it defeated the rule for exactly the small
+   deploys the cache is most often pointed at (issue #225). The one thing an
+   anchor is not protected from is being spent: past `MaxAge`, `MaxReuse` or a
+   policy generation, `Lookup` refuses the record anyway, so `Store.Update`
+   lets the next run replace it (`Record.stillTrusted`). Freezing a record no
+   run can be given would leave a deploy too small to ever measure anything
+   with a permanently dead entry.
+3. **The RTT measured now is the validation.** `Candidate.Validate` compares
+   the probe's answer against the record's. It costs nothing (the probe runs
+   anyway) and it is the only gate backed by a measurement taken today.
+4. **A ceiling is let go.** A pool capped at a remembered limit never asks for
+   more and so never finds out whether the limit is still there, so an
+   untested ceiling is carried at most `MaxCeilingCarry` runs.
+
+What the cache is worth, measured. Replaying every stored sweep with a *perfect*
+cache (the sweep's own single-stream control handed to `Plan` as
+`SourceCached`) against no cache at all: on the old 1 MiB/s prior it moved mean
+regret 3.91% to 3.38% and worst 24.4% to 14.4%; on the refitted prior it moves
+mean 3.36% to 3.38% and worst 14.4% to 14.4%. In other words the throughput
+half of this package was earning its keep by compensating for a badly chosen
+default, and on the data this repository has it now adds nothing. That is not
+an argument to delete it: the measured corpus is one host on one unshaped
+13 ms path, a real server-specific measurement still beats any fixed prior on a
+link that differs from it, and the connection ceiling a record carries is
+information the cost model cannot derive at all (it assumes perfect scaling).
+It is an argument not to reach for the cache to fix a number the prior should
+be fixing. See issue #230.
+
+Two more things to know before changing anything here. `request_concurrency`
+is deliberately outside the cache's reach: it is baked into an SFTP client at
+creation, so it must be resolved before there is a connection and therefore
+before a record can be checked against the link. And `autotune.PolicyVersion`
+is bumped when a change makes an older stored *measurement* mean something
+different (a different definition of what counts as one, a different meaning
+for a workload feature), not merely when it changes what the policy decides.
 
 ## Testing quirks
 
@@ -83,13 +261,49 @@ Look at how existing inputs are wired before adding a new one:
   `withDropFirstConnAfter`), request-triggered drops
   (`withDropOnRequest(method, path)`, which kills the live connection the
   first time a matching SFTP request arrives; use it to simulate a drop
-  during a non-transfer phase like a delete sweep or remote scan) and
-  request-triggered hangs (`withStallOnRequest`). Follow that pattern (wrap
+  during a non-transfer phase like directory setup, a stale-temp sweep, a
+  delete sweep or remote scan) and
+  request-triggered hangs (`withStallOnRequest`) and refused connections
+  (`withMaxConns(n)`, which closes everything accepted beyond the first n; the
+  connection pool's degradation path uses it). Follow that pattern (wrap
   the relevant `Handlers` field, add a `serverOption`) for new
   fault-injection needs instead of building a new fake server. Note that
   `withDropOnRequest` closes *every* live connection, including any
   `verifyClient` session opened before the drop fires; open verification
   clients after the run, not before.
+- Simulating a **non-OpenSSH server** takes two pieces, because the fake server
+  serves `posix-rename@openssh.com` whether or not it announces it:
+  `withFailPosixRename(code)` makes the extension fail with one exact SFTP
+  status (any `sftp.ErrSSHFx*` value; plain `Rename` keeps working, so the
+  remove+rename fallback can succeed), and `unadvertisePosixRename(t)` leaves
+  the extension out of the announced list a client reads. The second mutates a
+  pkg/sftp package-level variable, so it is process-global and restores itself
+  via `t.Cleanup`; no test in this package runs in parallel, which is what
+  makes that safe.
+- `withCoarseStatus(code)` is the other half of a non-OpenSSH server: it
+  answers every "not there" with one generic status code (`SSH_FX_FAILURE`,
+  `SSH_FX_BAD_MESSAGE`) instead of `SSH_FX_NO_SUCH_FILE`, across all four
+  handler roles at once, so a missing path looks the same whether the run
+  listed, stat'd, removed or opened it. It intercepts exactly the errors that
+  satisfy `os.ErrNotExist` and passes real refusals through, which is what
+  makes `remoteAbsent`'s tie-break testable in both directions (issue #152).
+  Give it before `withFailOpen`/`withFailList` when a test needs both.
+- A run may hold more than one connection (`advanced.connections`, issue
+  #158; how many is the policy's, issue #209). Only the per-file upload path
+  spreads over them, by file index modulo `session.spread`; `session.do` and
+  therefore everything else always uses the first one. Remote scans, directory
+  creation/chmod, stale-temp sweeps, file deletes and same-depth directory
+  deletes may call `session.do` concurrently, bounded by
+  `session.workers(items)`; they still open no extra connections. A connection
+  the server refuses is not an error: that pool slot falls back to the first
+  connection after one warning, and the run stops asking. The reconnect budget
+  stays run-wide and the stall watchdog closes every connection.
+- Parallel `MkdirAll` calls for different leaves can share a missing parent.
+  `pkg/sftp` normally resolves that race, but a connection drop between its
+  failed `Mkdir` and confirming `Lstat` can surface a misleading already-exists
+  error. `createRemoteDirs` confirms the completed leaf before failing and
+  turns a failed confirmation connection into a `session.do` retry; keep that
+  final-state check.
 - Every remote operation outside the per-file upload path must go through
   `session.do` (see `internal/uploader/session.go`): it redials on
   connection-class errors sharing the `retries` reconnect budget and marks
@@ -127,34 +341,217 @@ Look at how existing inputs are wired before adding a new one:
   toolchain it fails with "-race requires cgo". In that case run plain
   `go test ./...`, say so in the PR, and rely on CI for the race pass.
 
+## CI
+
+- Everything CI pulls from outside the repo is pinned by hash: actions by
+  their full commit SHA, and the self-test's SFTP container by `@sha256:`
+  digest with the readable tag as a trailing comment. Dependabot does not
+  update inline `docker run` digests, so that one is bumped by hand
+  (`docker buildx imagetools inspect atmoz/sftp:alpine`). Keep new external
+  dependencies pinned the same way.
+- Nothing may hang off `on: release`. release-please creates the release with
+  the `GITHUB_TOKEN`, and events raised by that token never start a workflow
+  run, so such a job silently never runs (v3.3.0 shipped without its benchmark
+  that way). Post-release work is a `uses:` call from `release-please.yml`,
+  gated on `needs.release-please.outputs.release_created`, as
+  `release-binaries`, `benchmark`, `benchmark-matrix` and `benchmark-analysis`
+  all do. The last three run in that order via `needs:`: the first two measure
+  the same host, and the third reads what they committed. A called workflow
+  runs inside the caller's run, which is why the release sweep takes a
+  concurrency group of its own instead of queueing behind a group that same run
+  already holds.
+- The self-test job in `.github/workflows/ci.yml` is the only place a real
+  OpenSSH server is exercised, and the only place `action.yml`'s composite
+  wiring runs end to end. Unit tests set `EASYSFTP_*` directly and never see
+  declared input defaults, which is how #62 shipped green.
+
+## Benchmarks
+
+**The harness is Go. All of it.** Issue #190 is finished: `cmd/easysftp-bench`
+measures, aggregates and stores, and the shell scripts it replaced are gone.
+`scripts/` now holds only the action's own launcher and its test. Nothing in the
+benchmark path needs `jq` any more.
+
+The commands are `standard` (throughput at the default settings), `matrix`
+(sweeps `advanced.connections` against `advanced.concurrency`), `store` (files a
+result set under `benchmarks/`), plus `aggregate` and `validate`. The first
+three read their configuration from the environment, exactly the variables the
+scripts read, so the workflows still pass the same things.
+
+The seam between measuring and reporting is `manifest.json`: the measuring half
+appends one JSON document per run to its JSONL files, writes a manifest
+describing the run, and the aggregation reads both. Keep that seam on disk. It
+is what made step 5's parity check possible (both implementations driven against
+one stub, their JSONL and manifests diffed), and it is what lets a failed run's
+artifact be re-aggregated afterwards. The manifest carries the display strings
+the summaries print (axis lists, the runner line, the settings sentence)
+verbatim rather than rebuilding them: a summary table that reformats itself is a
+change to a stored document made by accident.
+
+Comments through `internal/benchmark` name the shell files each piece was
+transcribed from. Those files are in git history, not on disk; they are cited
+because "the jq did it this way" is the honest reason several edge cases look
+the way they do.
+
+Inside `internal/benchmark`:
+
+- `schema` is what is on disk and must keep reading every result already
+  committed (its fixture test decodes every file under `benchmarks/` strictly,
+  so a type that does not cover a stored field fails). Anything nullable in a
+  stored document is a pointer here, and `Ordered` exists because a Go map
+  re-encodes its keys sorted: `index.json` is committed, and rewriting an
+  object's key order on the next store is a change nobody made.
+- `stats` is the old `JQ_STATS` block, and its edge cases are load-bearing
+  (lower middle median, `mad` null below two samples, null sorting below every
+  number and being the identity of addition); `report` renders the CSV and the
+  Markdown.
+- `scenario` is the payload tables (spec, description, shape, the per-scenario
+  axis caps), `runner` starts one build and reads its step outputs back,
+  `link` parses profiles and drives `tc` and `cmd/linkprobe`, `driver` is the
+  two measuring loops, and `store` is the result directory.
+- `driver`'s own tests re-execute the test binary as a stub easySFTP build and
+  assert on what comes out; `store`'s tests cover the result directory. Since
+  step 6 these are the only self-checks the harness has, so a behaviour worth
+  keeping belongs in one of them.
+
+A scenario carries a *shape* as well as a payload (`scenario.ShapeOf`: mode,
+whether the measured run redeploys over an unmeasured one, flat or deep
+layout). The deploy-shape scenarios (`redeploy`, `sync`, `deep`, `bulk`,
+`calib-*`) are matrix-only: `driver.StandardScenarios` is fixed, because adding
+to it makes every stored release result incomparable.
+`benchmarks/README.md` documents the store layout and the JSON schema and is the
+page to keep in sync when any of those change. Read `benchmarks/index.json`
+before opening single files.
+
+Results are filed by kind: `benchmarks/releases/`, `manual/`, `matrix/`, plus
+`archive/<kind>/`. Only `latest.{json,md}` and `index.json` sit at the top
+level, because those links must not move. `KIND=reindex go run
+./cmd/easysftp-bench store` rebuilds them from what is on disk (that is how the
+migration into this layout was done).
+
+Three invariants the whole thing rests on: a stored result is never rewritten
+(storing an existing name fails), `latest.*` is only ever a copy of a
+`kind: "release"` entry, and a matrix run is never official.
+`internal/benchmark/store`'s tests pin them. The other half (that a *real* run
+produces the metrics all of this aggregates) is asserted by the container
+self-test in `ci.yml`, which is also the only place the two measuring commands
+run against an actual SSH server.
+
+The link a result was measured over is recorded in a top-level `link` object
+(issue #184, phase 1) by `cmd/linkprobe`, a separate binary that imports nothing
+from `internal/uploader`: a control measurement taken through the code under test
+would not be a control. Three things to keep true when touching it: `environment`
+stays the comparability key and `link` stays a measurement (so it must not move
+into `environment`), the probe report never names the host or the user (it lands
+in `results.json`, which is an artifact and is committed), and `tc` shaping is
+applied only behind something that survives an interrupt (`link.Shaper.Guard`
+plus a deferred `Clear`), because a runner left shaped makes every later
+measurement on it quietly wrong.
+Shaping that is unavailable is recorded, never fatal.
+
+The matrix grid is **per scenario** (issue #184, phase 5). `scenario.AxisFor`
+caps and deduplicates both axes at the scenario's file count, and
+`scenario.SweepsRequests` only lets the `request_concurrency` axis through for
+payloads with files of at least 1 MiB, because that setting is
+`MaxConcurrentRequestsPerFile`. Both rules are properties of the payload, not
+opinions about the code: a value above the file count measures the same
+configuration twice (the stored `single` sweeps are 30 cells of one number).
+`axes` keeps what was requested and `axes.per_scenario` what was measured; do
+not collapse the two. That reduction is what pays for the `concurrency` axis
+running to 64, and the point of running it that far is that
+`scaling[].best_at_axis_max` should come out empty: a best cell on the largest
+swept value is a cut-off, not an optimum.
+
+Every sweep also measures `auto` (the settings easySFTP picks for itself) once
+per scenario and profile, and reports the regret against the best cell. It is
+deliberately not a build label in the grid: `auto` chooses a coordinate rather
+than sitting at one, so it stays out of `cells[]`, `scaling[]`, `comparison[]`
+and the CSV, and its chosen settings are read back from the run's own
+`config_*` counters rather than assumed. Changing the policy itself is #156 and
+belongs in its own PR; this only measures it.
+
+The `clean` deployment of an empty directory that runs before every measured run
+is instrumented too, into its own metrics file and its own `deletes[]` block
+(issue #184, phase 4): it is a pure delete sweep and the only measurement of
+deletions there is. Do not "simplify" it back to an unmeasured pre-clean, and
+keep its numbers out of `results[]` / `cells[]`: an upload aggregate that grew a
+`delete_sweep` phase is a bug, and `internal/benchmark/driver`'s tests assert it
+did not.
+
+Instrumentation lives in `internal/metrics` and is off unless
+`EASYSFTP_METRICS_FILE` names a path. It is deliberately **not** an
+`action.yml` input, so none of the drift-check lists apply to it. When metrics
+are off, `metrics.Enabled()` is false and `dialSSH` takes the plain `ssh.Dial`
+path: the byte-counting `net.Conn` must never end up in a production transfer.
+Phases are wall clock, operation samples are cumulative across the parallel
+upload workers; do not present the two as the same kind of number.
+
+A release is measured twice: `benchmark.yml` produces the official number at
+the default settings, and `benchmark-matrix.yml` sweeps the same tag over every
+scenario, stored under the tag as a *matrix* result. The three store invariants
+still hold, and the second of them is why a release sweep can never become
+`latest.*` no matter what its label says.
+
+`benchmarks/analysis/` is the optional Python layer that reads those documents
+and draws them (`benchdata.py` knows the schema, `plot.py` draws,
+`test_plot.py` checks both offline). `benchmark-analysis.yml` runs it after
+every release and publishes the figures as a release asset; that is the only
+automated consumer, and it must stay a consumer. It consumes canonical files only and must
+never become an input to the harness. Two rules make it survive the stored
+history: every field it reads is optional, because the results on disk span
+several schema versions, and every figure prints its provenance plus the
+caveats the stored file justifies (an unshaped link profile, failed repeats,
+refused connections). Its self-checks load *every* result committed under
+`benchmarks/`, so a reader that only understands the newest schema fails
+instead of silently dropping the older files. CI runs them in ci.yml's
+`analysis-tests` job whenever a pull request touches `benchmarks/`, so a
+change here (or a stored document the layer cannot read) fails on the PR that
+makes it. `out/` is ignored except for the gallery
+`benchmarks/analysis/README.md` refers to; regenerate those files with the
+commands printed under each image when a new sweep or release lands.
+
+## Behavior worth knowing before you change it
+
+- Uploads from **Windows runners** have no local permission bits to mirror:
+  Go synthesizes `0666` for writable files, `0444` for read-only ones, loses
+  the executable bit, and reports `0777` for directories (verified on Windows
+  11 / Go 1.25). That is what a run then requests via SETSTAT. Documented in
+  `docs/configuration.md`, `docs/troubleshooting.md` and `docs/examples.md`;
+  keep those in sync if the mode handling changes.
+- The three best-effort SETSTAT warnings (file-mode, dir-mode, preserve-times)
+  are warn-once **per deployment**, not per run: the flags live in
+  `transferEnv` (built in `uploadFiles`) and in `createRemoteDirs`' local
+  `warned`, both of which run once per deployment. The message texts say
+  "for this deployment" and a test pins it; see issue #121.
+
+## Vocabulary
+
+Two words that used to be one (issue #134):
+
+- **deployment** = one `source`/`target` mapping plus its mode and excludes,
+  i.e. one entry under `deployments:` (or the single inline pair). Use it for
+  anything that counts, groups or reports per mapping: `DeploymentStats`,
+  `Stats.Deployments`, "one warning per deployment", the `#### Deployments`
+  job-summary table.
+- **target** = the *remote path* only, matching the `target` input and the
+  `Target` column of that table. `checkRemoteRoot`, "remote target directory".
+
+Don't reintroduce "target" as a synonym for deployment.
+
+## docs/providers.md is evidence-only
+
+Provider entries are the one page where a plausible guess is worse than a gap:
+a wrong port or path costs a user a broken deploy and they cannot tell it came
+from nobody's machine. Every entry carries a `*Last verified: DATE, source*`
+line, and an automated session may only add what it can ground in the vendor's
+own documentation (link it) and must say so in that line. Never write "verified
+on a live account" for something you did not run. When in doubt, extend the
+generic "find your own settings" section instead, which is grounded in
+easySFTP's behavior rather than in a provider's.
+
 ## Release process
 
 `CHANGELOG.md` and `.easysftp-version` are generated by release-please from
 Conventional Commit messages; **never hand-edit `CHANGELOG.md`**. PR titles
 must be Conventional Commits (CI enforces this; squash-merge makes the PR
 title the commit message; see `CONTRIBUTING.md`).
-
-## Automated issue-driving sessions
-
-This repo receives autonomous sessions that each pick an open issue, resolve
-it (making a judgment call where the issue leaves one open; usability and
-user choice win ties, per the principles above), and open a draft PR. No one
-watches these sessions live; everything that matters must end up in the PR
-description or in an issue.
-
-- If you notice something during unrelated work (a typo, an inconsistency,
-  a possible optimization, something you're not confident enough to fix
-  right now), file it as a new GitHub issue rather than letting it evaporate
-  with the session. Label it `needs-check` if it genuinely needs a human or
-  a future session's closer look before acting. The label exists in the repo
-  now; note that `gh issue create --label` does *not* auto-create missing
-  labels (it errors), so a new label needs `gh label create` first.
-- Before working an issue, sanity-check it's still current (code may have
-  moved on since it was filed). If it's stale/already fixed/no longer
-  applicable, close it (with a reason) instead of implementing something
-  moot, and pick another.
-- New feature ideas that fit the SFTP-deploy niche are welcome as new issues;
-  don't implement speculative features nobody asked for in the same PR as an
-  unrelated fix.
-- One issue, one PR. Keep unrelated cleanups you notice out of the diff;
-  file them instead (see above) so the PR stays reviewable.

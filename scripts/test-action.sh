@@ -49,6 +49,34 @@ expect_equal 'Windows arm64 mapping' 'easysftp_windows_arm64.exe' "$(resolve_rel
 expect_failure 'unsupported OS' resolve_release_asset FreeBSD X64
 expect_failure 'unsupported architecture' resolve_release_asset Linux RISCV64
 
+# Credential masking (issue #149). The runner masks secrets.* by itself; these
+# cover the values it does not, and the encoding that keeps a multi-line
+# credential from ending the workflow command and printing itself in clear.
+expect_equal 'masks a plain value' '::add-mask::hunter2' "$(easysftp_add_mask hunter2)"
+expect_equal 'escapes a percent sign' '::add-mask::p%25ss' "$(easysftp_add_mask 'p%ss')"
+multiline_value=$'two\nlines'
+crlf_value=$'two\r\nlines'
+expect_equal 'escapes a newline instead of ending the command' '::add-mask::two%0Alines' "$(easysftp_add_mask "$multiline_value")"
+expect_equal 'escapes a carriage return' '::add-mask::two%0D%0Alines' "$(easysftp_add_mask "$crlf_value")"
+expect_equal 'skips an empty value' '' "$(easysftp_add_mask '')"
+expect_equal 'skips a whitespace-only value' '' "$(easysftp_add_mask '  ')"
+
+masked=$(
+  EASYSFTP_PASSWORD=direct-pass \
+  EASYSFTP_PASSPHRASE=key-pass \
+  EASYSFTP_PROXY_PASSWORD=jump-pass \
+  EASYSFTP_PROXY_PASSPHRASE=jump-key-pass \
+  EASYSFTP_PRIVATE_KEY='-----BEGIN OPENSSH PRIVATE KEY-----' \
+    mask_credentials
+)
+expect_equal 'masks every password and passphrase' \
+  '::add-mask::direct-pass
+::add-mask::key-pass
+::add-mask::jump-pass
+::add-mask::jump-key-pass' "$masked"
+expect_equal 'leaves private key material unmasked' '' "$(EASYSFTP_PRIVATE_KEY=secret-key mask_credentials)"
+expect_equal 'masks nothing when no credential is set' '' "$(mask_credentials)"
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -67,6 +95,9 @@ cat > "$tmp/bin/curl" <<'MOCK_CURL'
 set -euo pipefail
 output=''
 url=''
+saw_connect_timeout=0
+saw_max_time=0
+saw_retry_max_time=0
 while (( $# )); do
   case "$1" in
     --output)
@@ -74,6 +105,18 @@ while (( $# )); do
       shift 2
       ;;
     --max-redirs | --retry | --max-filesize)
+      shift 2
+      ;;
+    --connect-timeout)
+      saw_connect_timeout=1
+      shift 2
+      ;;
+    --max-time)
+      saw_max_time=1
+      shift 2
+      ;;
+    --retry-max-time)
+      saw_retry_max_time=1
       shift 2
       ;;
     --proto | --proto-redir)
@@ -88,6 +131,15 @@ while (( $# )); do
       ;;
   esac
 done
+# Issue #236: curl has no default timeouts, so a release fetch that stalls
+# after connecting hangs the step instead of failing it, and the job then
+# runs to the workflow timeout (six hours by default). A stalling stub
+# server is more machinery than the fix is worth; what can regress is
+# someone deleting a flag, and that is what this asserts.
+if (( ! saw_connect_timeout || ! saw_max_time || ! saw_retry_max_time )); then
+  printf 'mock curl: download_release_file must pass --connect-timeout, --max-time and --retry-max-time (issue #236)\n' >&2
+  exit 1
+fi
 cp "$MOCK_ASSET_DIR/${url##*/}" "$output"
 MOCK_CURL
 chmod +x "$tmp/bin/curl"
@@ -97,6 +149,14 @@ cat > "$tmp/bin/git" <<'MOCK_GIT'
 set -euo pipefail
 if [[ "${1:-}" != 'ls-remote' ]]; then
   exit 2
+fi
+# Issue #236: the same hang through git. resolve_release_commit runs on
+# every SHA-pinned job and talks to github.com with no bound of its own.
+if [[ "${GIT_TERMINAL_PROMPT:-}" != '0' ]] ||
+  [[ -z "${GIT_HTTP_LOW_SPEED_LIMIT:-}" ]] ||
+  [[ -z "${GIT_HTTP_LOW_SPEED_TIME:-}" ]]; then
+  printf 'mock git: resolve_release_commit must bound ls-remote with GIT_TERMINAL_PROMPT and the low-speed pair (issue #236)\n' >&2
+  exit 1
 fi
 printf '%s\t%s\n' \
   '1111111111111111111111111111111111111111' 'refs/tags/v1.2.3' \
@@ -158,6 +218,92 @@ expect_equal 'annotated release commit resolution' "$release_sha" "$(PATH="$tmp/
 expect_failure 'missing checksum entry' verify_release_checksum "$tmp/assets/easysftp_linux_x64" "$tmp/missing-checksum" 'easysftp_linux_x64'
 printf '%064d  easysftp_linux_x64\n' 0 > "$tmp/wrong-checksum"
 expect_failure 'wrong checksum' verify_release_checksum "$tmp/assets/easysftp_linux_x64" "$tmp/wrong-checksum" 'easysftp_linux_x64'
+
+# Build provenance (issue #146). The SHA-256 check alone proves transport
+# integrity only, because checksums.txt comes from the same mutable release as
+# the binary it describes. These cover the three answers the check can give,
+# with a mock gh: verified, ran and failed, and could not run.
+mkdir -p "$tmp/ghbin"
+cat > "$tmp/ghbin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" != 'attestation' || "${2:-}" != 'verify' ]]; then
+  exit 2
+fi
+if [[ "${3:-}" == '--help' ]]; then
+  exit 0
+fi
+# The identity of the signer is the whole point: a run must not accept an
+# attestation from another repository or another workflow.
+saw_repo=0
+saw_workflow=0
+saw_source_digest=0
+previous=''
+for arg in "$@"; do
+  case "$arg" in
+    eiserv/easySFTP) saw_repo=1 ;;
+    eiserv/easySFTP/.github/workflows/release-binaries.yml) saw_workflow=1 ;;
+  esac
+  if [[ "$previous" == '--source-digest' && "$arg" == "${EXPECTED_SOURCE_DIGEST:-}" ]]; then
+    saw_source_digest=1
+  fi
+  previous=$arg
+done
+if (( ! saw_repo || ! saw_workflow )); then
+  printf 'mock gh: verify_release_provenance must pin --repo and --signer-workflow\n' >&2
+  exit 1
+fi
+if [[ -n "${EXPECTED_SOURCE_DIGEST:-}" && "$saw_source_digest" != 1 ]]; then
+  printf 'mock gh: verify_release_provenance must pin --source-digest to the action commit\n' >&2
+  exit 1
+fi
+if [[ -z "${GH_TOKEN:-}" ]]; then
+  printf 'mock gh: no token was passed through\n' >&2
+  exit 1
+fi
+exit "${MOCK_GH_EXIT:-0}"
+MOCK_GH
+chmod +x "$tmp/ghbin/gh"
+
+# The three cases differ only in the environment the check runs in. The
+# failing one is a function because expect_failure takes a command, and its
+# body is a subshell so the environment it sets does not leak into the rest of
+# this script.
+provenance_asset="$tmp/assets/easysftp_linux_x64"
+
+provenance_ok=$(PATH="$tmp/ghbin:$PATH" GH_TOKEN=mock-token \
+  EXPECTED_SOURCE_DIGEST="$release_sha" \
+  verify_release_provenance "$provenance_asset" easysftp_linux_x64 v1.2.3 "$release_sha")
+expect_equal 'verified provenance is reported' \
+  "Verified build provenance for easysftp_linux_x64 (v1.2.3, built by eiserv/easySFTP/.github/workflows/release-binaries.yml from source commit $release_sha)" \
+  "$provenance_ok"
+
+failing_provenance() (
+  PATH="$tmp/ghbin:$PATH" GH_TOKEN=mock-token MOCK_GH_EXIT=1 \
+    verify_release_provenance "$provenance_asset" easysftp_linux_x64 v1.2.3
+)
+expect_failure 'a failed provenance check fails the run' failing_provenance
+
+# A runner without the tooling keeps working on the checksum alone and says so.
+# Tampering fails closed; a missing prerequisite does not break a deploy. Both
+# ways of missing it are covered: no gh on PATH, and no token to read the
+# attestation with.
+mkdir -p "$tmp/nogh"
+no_gh_warning=$(PATH="$tmp/nogh" \
+  verify_release_provenance "$provenance_asset" easysftp_linux_x64 v1.2.3)
+no_token_warning=$(PATH="$tmp/ghbin:$PATH" GH_TOKEN='' GITHUB_TOKEN='' \
+  verify_release_provenance "$provenance_asset" easysftp_linux_x64 v1.2.3)
+for warning in "$no_gh_warning" "$no_token_warning"; do
+  case "$warning" in
+    '::warning::easySFTP action: could not verify the build provenance'*)
+      echo 'PASS: an unavailable provenance check warns instead of failing'
+      ;;
+    *)
+      echo "FAIL: an unavailable provenance check should warn, got '$warning'" >&2
+      failures=$((failures + 1))
+      ;;
+  esac
+done
 
 if (( failures != 0 )); then
   echo "$failures action test(s) failed" >&2

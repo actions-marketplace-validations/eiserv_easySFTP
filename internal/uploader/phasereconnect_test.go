@@ -15,6 +15,39 @@ import (
 	"github.com/eiserv/easySFTP/internal/config"
 )
 
+// Each leaf directory has its own retry scope. A connection drop while one
+// MkdirAll is active must reconnect and finish the other independent leaves,
+// rather than failing before uploads begin.
+func TestReconnectsDuringDirectorySetup(t *testing.T) {
+	srv := startTestServer(t, withDropOnRequest("Mkdir", "/www/b"))
+	local := t.TempDir()
+	writeTree(t, local, map[string]string{
+		"a/one.txt": "one",
+		"b/two.txt": "two",
+	})
+
+	cfg := baseConfig(srv)
+	cfg.Concurrency = 2
+	cfg.Retries = 2
+	cfg.Uploads = []config.UploadPair{{Local: local, Remote: "/www"}}
+
+	log := &recordingLogger{testLogger: testLogger{t}}
+	if _, err := Run(context.Background(), cfg, log); err != nil {
+		t.Fatalf("expected directory setup to survive the connection drop, got %v", err)
+	}
+	for remote, want := range map[string]string{
+		"/www/a/one.txt": "one",
+		"/www/b/two.txt": "two",
+	} {
+		if got := readRemote(t, srv, remote); got != want {
+			t.Errorf("%s content: got %q, want %q", remote, got, want)
+		}
+	}
+	if got := reconnectWarnings(log); got != 1 {
+		t.Errorf("reconnect warnings: got %d, want one collapsed redial; warnings: %v", got, log.warnings)
+	}
+}
+
 // A connection drop during the clean strategy's delete sweep must redial and
 // finish the sweep, not fail the run.
 func TestCleanReconnectsDuringDeletePhase(t *testing.T) {
@@ -49,6 +82,9 @@ func TestCleanReconnectsDuringDeletePhase(t *testing.T) {
 	}
 	if !loggedReconnect(log) {
 		t.Errorf("expected a reconnect warning, got %v", log.warnings)
+	}
+	if got := reconnectWarnings(log); got != 1 {
+		t.Errorf("reconnect warnings: got %d, want one collapsed redial; warnings: %v", got, log.warnings)
 	}
 }
 
@@ -152,10 +188,15 @@ func TestStallTimeoutCoversDeletePhase(t *testing.T) {
 
 // loggedReconnect reports whether the run logged a reconnect warning.
 func loggedReconnect(log *recordingLogger) bool {
+	return reconnectWarnings(log) > 0
+}
+
+func reconnectWarnings(log *recordingLogger) int {
+	count := 0
 	for _, w := range log.warnings {
 		if strings.Contains(w, "reconnecting") {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
 }

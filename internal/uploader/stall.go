@@ -4,21 +4,25 @@ import (
 	"io"
 	"sync/atomic"
 	"time"
+
+	"github.com/eiserv/easySFTP/internal/metrics"
 )
 
 // stallWatchdog fails a run fast when its active transfers stop making
 // progress. Transfers mark themselves active for the duration of each upload
-// attempt and tick the watchdog on every read that moved bytes. A monitor
+// attempt and tick the watchdog after a remote write round completes. A monitor
 // goroutine fires when transfers are active but no tick arrived for the
-// configured timeout; firing closes the SSH connection, which unblocks every
-// SFTP operation stuck on the stalled server with an error, so the run fails
-// in minutes with a clear message instead of hanging until the job-level
+// configured timeout; firing closes the run's SSH connections, which unblocks
+// every SFTP operation stuck on the stalled server with an error, so the run
+// fails in minutes with a clear message instead of hanging until the job-level
 // timeout.
 //
-// Closing the whole connection (rather than aborting just the stalled file)
-// is deliberate: all transfers share one SSH session, and a write blocked on
-// an exhausted SSH channel window cannot be interrupted any other way. A
-// server that stalls one transfer has stalled the session.
+// Closing whole connections (rather than aborting just the stalled file) is
+// deliberate: transfers share a connection, and a write blocked on an
+// exhausted SSH channel window cannot be interrupted any other way. With a
+// connection pool every connection goes, since the watchdog only knows that
+// the run as a whole stopped moving bytes: a server that stalls one transfer
+// has stalled the run.
 type stallWatchdog struct {
 	timeout time.Duration
 	kill    func() // closes the SSH connection
@@ -78,6 +82,7 @@ func (w *stallWatchdog) monitor() {
 		}
 		if time.Since(lastChange) >= w.timeout {
 			w.fired.Store(true)
+			metrics.Count("stalls", 1)
 			w.log.Warningf("no transfer progress for %s; closing the connection so the run fails fast (stall-timeout)", w.timeout)
 			w.kill()
 			return
@@ -85,18 +90,26 @@ func (w *stallWatchdog) monitor() {
 	}
 }
 
-// reader wraps r so that every read that moved bytes counts as progress.
-func (w *stallWatchdog) reader(r io.Reader) io.Reader { return &tickReader{w: w, r: r} }
-
-type tickReader struct {
-	w *stallWatchdog
-	r io.Reader
+// writeProgress wraps the source with a one-read lag. uploadFile deliberately
+// passes a reader without Size/Len/Stat to pkg/sftp, which keeps its ReadFrom
+// loop sequential: it asks for the next packet only after the previous remote
+// write completed. Ticking before that next read therefore records server-side
+// progress, while ticking on the first local read would not.
+func (w *stallWatchdog) writeProgress(r io.Reader) io.Reader {
+	return &writeProgressReader{w: w, r: r}
 }
 
-func (t *tickReader) Read(p []byte) (int, error) {
-	n, err := t.r.Read(p)
-	if n > 0 {
-		t.w.ticks.Add(1)
+type writeProgressReader struct {
+	w       *stallWatchdog
+	r       io.Reader
+	pending bool
+}
+
+func (r *writeProgressReader) Read(p []byte) (int, error) {
+	if r.pending {
+		r.w.tick()
 	}
+	n, err := r.r.Read(p)
+	r.pending = n > 0
 	return n, err
 }

@@ -28,9 +28,10 @@ inputs:
     required: false
   password:
     description: >-
-      Password used for authentication. Provide this or private-key (or both).
-      Always store this in a GitHub Actions secret. As a credential, this
-      input is used in both inline and config mode.
+      Password used for password or single-prompt keyboard-interactive
+      authentication. Provide this or private-key (or both). Always store this
+      in a GitHub Actions secret. As a credential, this input is used in both
+      inline and config mode.
     required: false
   private-key:
     description: >-
@@ -90,6 +91,29 @@ inputs:
       "node_modules/"). Prefix with "!" to re-include files.
     required: false
 
+  # --- Permissions (inline mode) ---
+  file-mode:
+    description: >-
+      Octal permission (e.g. "0644") applied to every uploaded file, instead
+      of mirroring the local file's bits. Worth setting on Windows runners,
+      which have no POSIX bits to mirror and otherwise upload world-writable
+      files. Best-effort: a server that rejects the chmod warns, it does not
+      fail the run. In config mode this is permissions.files.
+    required: false
+  dir-mode:
+    description: >-
+      Octal permission (e.g. "0755") applied to every remote directory the
+      run creates or touches, instead of leaving the server's umask default.
+      Best-effort, like file-mode. In config mode this is
+      permissions.directories.
+    required: false
+  preserve-times:
+    description: >-
+      Set to "true" to keep each uploaded file's local modification time on
+      the server instead of "now". Best-effort, like file-mode. In config
+      mode this is permissions.preserve_times.
+    required: false
+
   # --- Config mode ---
   config:
     description: >-
@@ -101,8 +125,9 @@ inputs:
     required: false
   proxy-password:
     description: >-
-      Password for the jump host defined as connection.proxy in the config
-      file. Always store this in a GitHub Actions secret.
+      Password for password or single-prompt keyboard-interactive
+      authentication to the jump host defined as connection.proxy in the
+      config file. Always store this in a GitHub Actions secret.
     required: false
   proxy-private-key:
     description: >-
@@ -195,15 +220,6 @@ inputs:
   manifest-name:
     description: "Removed in v3: moved to 'sync.manifest' in the config file. See docs/migration-v3.md."
     required: false
-  dir-mode:
-    description: "Removed in v3: moved to 'permissions.directories' in the config file. See docs/migration-v3.md."
-    required: false
-  file-mode:
-    description: "Removed in v3: moved to 'permissions.files' in the config file. See docs/migration-v3.md."
-    required: false
-  preserve-times:
-    description: "Removed in v3: moved to 'permissions.preserve_times' in the config file. See docs/migration-v3.md."
-    required: false
   proxy-server:
     description: "Removed in v3: moved to 'connection.proxy.host' in the config file. See docs/migration-v3.md."
     required: false
@@ -227,6 +243,12 @@ outputs:
   files-deleted:
     description: Number of remote files deleted by the clean/sync mode.
     value: ${{ steps.easysftp.outputs.files-deleted }}
+  dirs-deleted:
+    description: >-
+      Number of remote directories removed by the clean mode's sweep or the
+      sync mode's prune. Counted against safety.max_deletes together with
+      files-deleted.
+    value: ${{ steps.easysftp.outputs.dirs-deleted }}
   files-skipped:
     description: >-
       Number of unchanged files skipped (by the sync mode, or by overlay
@@ -242,6 +264,24 @@ outputs:
 runs:
   using: composite
   steps:
+    # First, before anything else has a chance to log. The runner masks
+    # values it read from secrets.* by itself; this covers the cases it does
+    # not, such as a credential produced by an earlier step's output, a
+    # matrix entry, a plain environment variable or a vault action. Private
+    # keys are deliberately left out; see mask_credentials in
+    # scripts/action-lib.sh for why (issue #149).
+    - name: Mask credentials
+      shell: bash
+      run: |
+        action_path="${ACTION_PATH//\\//}"
+        bash "$action_path/scripts/mask-credentials.sh"
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        EASYSFTP_PASSWORD: ${{ inputs.password }}
+        EASYSFTP_PASSPHRASE: ${{ inputs.passphrase }}
+        EASYSFTP_PROXY_PASSWORD: ${{ inputs.proxy-password }}
+        EASYSFTP_PROXY_PASSPHRASE: ${{ inputs.proxy-passphrase }}
+
     - name: Prepare easySFTP
       id: prepare
       shell: bash
@@ -252,6 +292,10 @@ runs:
         INPUT_BUILD_MODE: ${{ inputs.build-mode }}
         ACTION_PATH: ${{ github.action_path }}
         ACTION_REF: ${{ github.action_ref }}
+        # Read-only use: the attestation API of a public repository. A job
+        # that restricts or removes the token only loses the provenance
+        # check, which then warns instead of failing the deploy.
+        GH_TOKEN: ${{ github.token }}
 
     - name: Set up Go
       if: steps.prepare.outputs.build-mode == 'source'
@@ -290,6 +334,9 @@ runs:
         EASYSFTP_TARGET: ${{ inputs.target }}
         EASYSFTP_MODE: ${{ inputs.mode }}
         EASYSFTP_EXCLUDE: ${{ inputs.exclude }}
+        EASYSFTP_FILE_MODE: ${{ inputs.file-mode }}
+        EASYSFTP_DIR_MODE: ${{ inputs.dir-mode }}
+        EASYSFTP_PRESERVE_TIMES: ${{ inputs.preserve-times }}
         EASYSFTP_CONFIG: ${{ inputs.config }}
         EASYSFTP_PROXY_PASSWORD: ${{ inputs.proxy-password }}
         EASYSFTP_PROXY_PRIVATE_KEY: ${{ inputs.proxy-private-key }}
@@ -314,9 +361,6 @@ runs:
         EASYSFTP_SYNC_FAST_PATH: ${{ inputs.sync-fast-path }}
         EASYSFTP_SKIP_UNCHANGED: ${{ inputs.skip-unchanged }}
         EASYSFTP_MANIFEST_NAME: ${{ inputs.manifest-name }}
-        EASYSFTP_DIR_MODE: ${{ inputs.dir-mode }}
-        EASYSFTP_FILE_MODE: ${{ inputs.file-mode }}
-        EASYSFTP_PRESERVE_TIMES: ${{ inputs.preserve-times }}
         EASYSFTP_PROXY_SERVER: ${{ inputs.proxy-server }}
         EASYSFTP_PROXY_PORT: ${{ inputs.proxy-port }}
         EASYSFTP_PROXY_USERNAME: ${{ inputs.proxy-username }}

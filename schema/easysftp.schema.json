@@ -45,6 +45,17 @@
           "description": "Explicitly skip host key verification. NOT recommended: allows man-in-the-middle attacks.",
           "type": "boolean"
         },
+        "algorithms": {
+          "description": "Optional SSH algorithms to allow in addition to the library's supported secure set. Use only for a legacy server that cannot negotiate modern algorithms. Unknown names are rejected and insecure additions produce a warning.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "key_exchanges": { "$ref": "#/$defs/algorithmList" },
+            "ciphers": { "$ref": "#/$defs/algorithmList" },
+            "macs": { "$ref": "#/$defs/algorithmList" },
+            "host_key_algorithms": { "$ref": "#/$defs/algorithmList" }
+          }
+        },
         "proxy": {
           "description": "Optional jump host (bastion) through which the SFTP server is reached, like OpenSSH's ProxyJump. Credentials come from the proxy-password / proxy-private-key / proxy-passphrase action inputs.",
           "type": "object",
@@ -126,7 +137,7 @@
       "additionalProperties": false,
       "properties": {
         "max_deletes": {
-          "description": "Refuse a run that would delete more than this many files. 0 means unlimited. Deleting the remote root is always refused, regardless of this value.",
+          "description": "Refuse a run that would remove more than this many remote entries, files and directories together, across all of its deployments. 0 means unlimited. Deleting the remote root is always refused, regardless of this value.",
           "type": "integer",
           "minimum": 0
         }
@@ -153,16 +164,25 @@
           "minimum": 0
         },
         "concurrency": {
-          "description": "Number of files uploaded in parallel, or \"auto\" for the built-in default.",
+          "description": "Maximum parallel file uploads and independent remote metadata requests, including directory setup, stale-temp cleanup, scans, and deletes. \"auto\" (the default) sizes it to the number of independent items the phase has, capped at 64.",
           "$ref": "#/$defs/autoInt"
         },
         "request_concurrency": {
-          "description": "Maximum in-flight SFTP requests per file (pipelining within one file's transfer), or \"auto\" for the built-in default.",
+          "description": "Maximum in-flight SFTP requests per file (pipelining within one file's transfer). \"auto\" (the default) sizes it to the largest file being uploaded: 16 for a tree of small files, up to 64 for large ones.",
+          "$ref": "#/$defs/autoInt"
+        },
+        "connections": {
+          "description": "Number of SSH connections uploads may spread over (never more than concurrency). More connections lift the single-TCP-flow and single-cipher-stream ceiling on high-latency links, but some servers and shared hosts limit concurrent connections per account. \"auto\" (the default) opens another one only while it would save more time than its SSH handshake costs, up to 8, and widens the pool while a long transfer runs if the measured throughput justifies it.",
           "$ref": "#/$defs/autoInt"
         },
         "skip_unchanged": {
           "description": "For overlay deployments, skip uploading a file when the remote file already exists with the same size (coarse; use mode sync for exact content comparison).",
           "type": "boolean"
+        },
+        "auto_cache": {
+          "description": "Path to a local file where easySFTP remembers what it measured about this server (round-trip time, per-connection throughput, any connection limit the server showed), so a later run can plan from a measurement instead of its built-in assumption. Unset (the default) switches the cache off. It only affects settings left at \"auto\", it never restores stored settings, and a stale or unreadable file costs a warning rather than the deploy. On ephemeral CI runners the file has to be persisted between runs, e.g. with actions/cache.",
+          "type": "string",
+          "minLength": 1
         }
       }
     },
@@ -193,7 +213,7 @@
       "additionalProperties": false,
       "properties": {
         "fast_path": {
-          "description": "Reuse a file's manifest hash instead of re-reading it when size and modification time still match (rsync-style quick check; can miss same-size same-second edits).",
+          "description": "Reuse a file's manifest hash instead of re-reading it when size and modification time (nanosecond resolution) still match (rsync-style quick check; can miss a same-size edit only when the timestamp is also identical).",
           "type": "boolean"
         },
         "manifest": {
@@ -205,6 +225,14 @@
     }
   },
   "$defs": {
+    "algorithmList": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "mode": {
       "description": "How the remote target is reconciled: overlay (upload only), sync (manifest-tracked mirror) or clean (wipe, then upload).",
       "type": "string",
@@ -216,6 +244,7 @@
       "items": { "type": "string" }
     },
     "autoInt": {
+      "description": "A fixed number, or \"auto\" to let easySFTP choose the value per deployment from the workload and the measured link. Absent means \"auto\". Each setting is resolved on its own, so pinning one leaves the others adaptive.",
       "oneOf": [
         { "type": "integer", "minimum": 1 },
         { "const": "auto" }

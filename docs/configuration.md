@@ -46,7 +46,7 @@ Everything else has a sensible default.
 | `host` | ✅ | - | Hostname or IP of the SFTP server. |
 | `port` | | `22` | SSH port. |
 | `username` | ✅ | - | Username for authentication. |
-| `password` | ¹ | - | Password. **Use a secret.** |
+| `password` | ¹ | - | Password, offered through SSH password and single-prompt keyboard-interactive authentication. **Use a secret.** |
 | `private-key` | ¹ | - | SSH private key (OpenSSH/PEM format). **Use a secret.** |
 | `passphrase` | | - | Passphrase of the private key, if encrypted. |
 | `host-key` | ² | - | Expected SHA256 host key fingerprint(s), one per line (`SHA256:...`). See [Security](security.md). |
@@ -64,6 +64,21 @@ Everything else has a sensible default.
 | `target` | ✅ | - | Remote destination path. |
 | `mode` | | `overlay` | [Reconciliation mode](strategies.md): `overlay`, `sync` or `clean`. |
 | `exclude` | | - | Gitignore-style exclude patterns, one per line. `!` re-includes. |
+
+### Permissions (inline mode)
+
+| Input | Default | Description |
+|---|---|---|
+| `file-mode` | mirror local | Octal permission (e.g. `"0644"`) for every uploaded file. |
+| `dir-mode` | server umask | Octal permission (e.g. `"0755"`) for every remote directory the run creates or touches. |
+| `preserve-times` | `false` | Keep each uploaded file's local modification time on the server. |
+
+All three are best-effort: a server that rejects the `SETSTAT` request
+produces one warning per deployment, not a failure. Their config-mode
+equivalents are [`permissions.*`](#permissions); like every other non-secret
+setting they belong to exactly one mode, so setting them alongside `config`
+fails the run. Set at least `file-mode: "0644"` when you deploy from a
+Windows runner (see the [note below](#permissions)).
 
 ### Run-wide switches (both modes)
 
@@ -90,9 +105,10 @@ step shrinks to the config path plus credentials:
     # proxy-private-key: ${{ secrets.JUMP_PRIVATE_KEY }}
 ```
 
-Setting any inline connection/deployment input (`host`, `port`, `username`,
-`host-key`, `known-hosts`, `allow-any-host-key`, `source`, `target`, `mode`,
-`exclude`) alongside `config` fails the run: there is no mixed mode.
+Setting any inline connection/deployment/permission input (`host`, `port`,
+`username`, `host-key`, `known-hosts`, `allow-any-host-key`, `source`,
+`target`, `mode`, `exclude`, `file-mode`, `dir-mode`, `preserve-times`)
+alongside `config` fails the run: there is no mixed mode.
 
 The only inputs that combine with `config` are the credentials (`password`,
 `private-key`, `passphrase`, and the `proxy-*` credential counterparts) and
@@ -116,6 +132,11 @@ connection:
   # known_hosts: |             # alternative to host_key
   #   sftp.example.com ssh-ed25519 AAAA...
   # allow_any_host_key: true   # explicit opt-out (not recommended)
+  # algorithms:                # legacy-server escape hatch; warns when insecure
+  #   key_exchanges: [diffie-hellman-group1-sha1]
+  #   ciphers: [aes128-cbc]
+  #   macs: [hmac-sha1-96]
+  #   host_key_algorithms: [ssh-rsa]
   # proxy:                     # optional jump host / bastion
   #   host: bastion.example.com
   #   username: jumper
@@ -140,15 +161,17 @@ deployments:                   # at least one named deployment
     mode: clean
 
 safety:
-  max_deletes: 500             # 0 = unlimited
+  max_deletes: 500             # files + directories, whole run; 0 = unlimited
 
 advanced:
   retries: 2
   timeout: 30
   stall_timeout: 0
-  concurrency: auto            # or a number
+  concurrency: auto            # or a number; see docs/tuning.md
   request_concurrency: auto
+  connections: auto            # SSH connections uploads spread over
   skip_unchanged: false
+  # auto_cache: .easysftp-cache/auto.json   # off unless set; see below
 
 permissions:
   files: "0644"
@@ -168,7 +191,7 @@ sync:
 | `connection` | ✅ | Where and as whom to connect. Credentials are **not** here; they stay inputs. |
 | `defaults` | | `mode` and `exclude` defaults applied to every deployment. |
 | `deployments` | ✅ | A **map** of named deployments (at least one). The name appears in logs and the job summary. |
-| `safety` | | `max_deletes` (0 = unlimited); see [delete guards](strategies.md#delete-guards). |
+| `safety` | | `max_deletes`: the most remote entries, **files and directories together**, the **whole run** may remove (0 = unlimited, the default); see [delete guards](strategies.md#delete-guards). |
 | `advanced` | | Transfer tuning; the defaults suit most deploys. |
 | `permissions` | | Remote file/dir modes and `preserve_times` (all best-effort). |
 | `sync` | | The sync mode's manifest name and fast-path. |
@@ -183,7 +206,14 @@ sync:
 | `host_key` | ³ | - | SHA256 fingerprint(s), one per line. |
 | `known_hosts` | ³ | - | `known_hosts`-format host key(s); alternative to `host_key`. |
 | `allow_any_host_key` | ³ | `false` | Explicit opt-out of host key verification. |
+| `algorithms` | | - | Add legacy `key_exchanges`, `ciphers`, `macs`, or `host_key_algorithms` to the SSH negotiation policy for both the target and proxy hop. Unknown names fail; insecure additions warn and appear in the job summary. |
 | `proxy` | | - | Optional jump host; same fields (`host`, `port`, `username`, `host_key`, `known_hosts`, `allow_any_host_key`). |
+
+`connection.algorithms` is an escape hatch for a server that cannot negotiate
+modern SSH. It is additive: each configured category keeps all algorithms the
+current `golang.org/x/crypto/ssh` version classifies as supported and adds the
+named values. Categories you omit keep the library defaults exactly. Prefer
+upgrading the server, and enable only the one algorithm the server needs.
 
 ³ As in inline mode, exactly one of `host_key`/`known_hosts`/`allow_any_host_key` is required, per hop.
 
@@ -200,23 +230,112 @@ sync:
 
 | Field | Default | Description |
 |---|---|---|
-| `retries` | `2` | Retries per file on transient errors, and the reconnect budget for dropped connections. `0` disables. |
+| `retries` | `2` | Retries per file on transient errors, and the reconnect budget for dropped connections. Failures the server reports with a permanent status code are never retried; see [which upload failures are retried](troubleshooting.md#which-upload-failures-easysftp-retries). `0` disables. |
 | `timeout` | `30` | Connection timeout in seconds. `0` disables. |
 | `stall_timeout` | `0` (off) | Abort when active remote operations make no progress for this many seconds. |
-| `concurrency` | `auto` (4) | Files uploaded in parallel. Also bounds the sync hashing worker pool. `auto` uses the built-in default. |
-| `request_concurrency` | `auto` (16) | Max in-flight SFTP requests per file (pipelining within one transfer). |
+| `concurrency` | `auto` | Files uploaded in parallel, and independent remote metadata requests such as directory setup, stale-temp cleanup, scans and deletes. `auto` sizes it to the work (see [transfer tuning](tuning.md)). Sync hashing uses the runner's available Go CPU parallelism independently. |
+| `request_concurrency` | `auto` | Max in-flight SFTP requests per file (pipelining within one transfer). `auto` sizes it to the largest file and to what the whole set costs to hold in flight (see [transfer tuning](tuning.md)). |
+| `connections` | `auto` | SSH connections the parallel uploads spread over. Never more than `concurrency`. `auto` opens another one only while it would save more time than its handshake costs. See below. |
 | `skip_unchanged` | `false` | For `overlay`, skip a file whose remote counterpart has the same size (coarse; `sync` compares content hashes). |
+| `auto_cache` | unset (off) | Path to a file where easySFTP remembers what it measured about this server, so a later run can plan from a measurement instead of an assumption. Only affects settings left at `auto`. See below and [transfer tuning](tuning.md#remembering-what-it-measured). |
+
+##### `connections`: more than one TCP flow
+
+A single SSH connection carries the whole deploy over one TCP congestion window
+and one cipher stream, no matter how high `concurrency` and
+`request_concurrency` are. On a long-distance link that window is what caps
+throughput, and neither knob can lift it.
+
+`connections: 4` opens up to four connections and spreads the parallel uploads
+over them. Remote scans and deletes issue up to `concurrency` independent
+requests over the first connection. Directory setup and stale-temp cleanup use
+the same limit, and the sync manifest stays on that connection too. This keeps
+the server-facing parallelism under one limit without paying for extra SSH
+handshakes during metadata-only work.
+
+At `auto` (the default) easySFTP decides per deployment, because a connection
+is not free:
+
+- **Each connection repeats the handshake**, including host key verification.
+  A short run of a few files pays that for nothing, so `auto` opens another
+  connection only while the time it would save is larger than the handshake it
+  costs. A one-second redeploy gets one connection; a two-thousand-file upload
+  over a link with real latency gets several. [Transfer tuning](tuning.md)
+  explains the rule and how to read the log line it prints.
+- **Server limits are real.** sshd's `MaxStartups` and per-account connection
+  limits on shared hosting will refuse the extra connections. easySFTP then
+  warns, finishes the deploy on the ones it has and stops asking for more, so a
+  too-high value costs a warning, not a failed deploy.
+- **The `retries` budget is shared.** Reconnects are counted per run, not per
+  connection.
+- **The stall watchdog closes all of them.** `stall_timeout` only knows that
+  the run stopped moving bytes, not which connection stalled.
+
+Pin a number when your host has a connection limit you already know, or when
+you measured something better than what `auto` picks. easySFTP's own numbers
+live in [`benchmarks/`](../benchmarks/README.md).
+
+##### `auto_cache`: keep what was measured
+
+`auto` has to guess one thing it cannot know before any bytes move: how fast
+the link actually is. `auto_cache` names a file where easySFTP writes what it
+measured instead, so the next run starts from the measurement.
+
+```yaml
+advanced:
+  auto_cache: .easysftp-cache/auto.json
+```
+
+On a GitHub-hosted runner the file has to be kept between runs, which
+`actions/cache` does:
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: .easysftp-cache
+    key: easysftp-auto-${{ github.repository }}
+- uses: eiserv/easySFTP@v3
+  with:
+    config: .github/easysftp.yml
+    password: ${{ secrets.SFTP_PASSWORD }}
+```
+
+The file holds no credentials and does not name the server (the target is
+stored as a fingerprint). It only ever affects settings left at `auto`; a
+number you wrote always wins. A missing, unreadable or outdated file costs at
+most a warning, never the deploy. [Transfer
+tuning](tuning.md#remembering-what-it-measured) explains what is stored, what
+is restored (a measurement, never a decision) and when a record stops being
+used. The path is trusted configuration and is not a filesystem sandbox;
+normally keep it under the workspace or the runner's temporary directory.
+Concurrent runs may share one path: write-back is serialized and merges the
+latest records instead of replacing another run's update.
 
 #### `permissions`
 
 | Field | Default | Description |
 |---|---|---|
-| `files` | mirror local | Octal permission (e.g. `"0644"`) for every uploaded file. |
+| `files` | mirror local | Octal permission (e.g. `"0644"`) for every uploaded file. On Windows runners there are no local bits to mirror; see the note below. |
 | `directories` | server umask | Octal permission (e.g. `"0755"`) for every remote directory the run creates or touches. |
 | `preserve_times` | `false` | Keep each uploaded file's local modification time on the server. |
 
 All three are best-effort: a server that rejects the `SETSTAT` request
-produces one warning per run, not a failure.
+produces one warning per deployment (not one per file, and not a failure), so
+a multi-deployment run shows which deployments are affected. Servers without
+POSIX permissions behind them reject it as a matter of course; see
+[what easySFTP needs from a server](providers.md#what-easysftp-needs-from-a-server).
+In inline mode the same three settings are the `file-mode`, `dir-mode` and
+`preserve-times` [inputs](#permissions-inline-mode).
+
+> **Windows runners:** Windows has no POSIX permission bits, so "mirror local"
+> has nothing to mirror. Go reports `0666` for every writable file and `0444`
+> for read-only ones (and loses the executable bit), which is what the run
+> then requests on the server. The same deploy from `windows-latest` therefore
+> uploads world-writable `666` files where `ubuntu-latest` would upload `644`,
+> which some web servers reject and security scans flag. Set `files: "0644"`
+> (and `directories: "0755"`) explicitly when you deploy from a Windows
+> runner, or the equivalent `file-mode` / `dir-mode` inputs if you deploy
+> inline.
 
 #### `sync`
 
@@ -289,6 +408,7 @@ exclude: |
 |---|---|
 | `files-uploaded` | Number of uploaded files (planned files in dry-run mode). |
 | `files-deleted` | Number of remote files removed by the `clean`/`sync` mode. |
+| `dirs-deleted` | Number of remote directories removed by the `clean` mode's sweep or the `sync` mode's prune. Counted against `safety.max_deletes` together with `files-deleted`. |
 | `files-skipped` | Number of unchanged files skipped (by `sync`, or by `overlay` with `advanced.skip_unchanged`). |
 | `bytes-uploaded` | Total bytes transferred (planned bytes in dry-run mode). |
 | `duration-ms` | Total runtime in milliseconds. |
@@ -304,7 +424,9 @@ reporting or rollback step must consume these partial results. See
 [examples](examples.md#using-the-outputs).
 
 The `files-*`/`bytes-uploaded` outputs stay run-wide totals; there is no
-per-deployment output.
+per-deployment output. Sizes are rendered for humans in the summary and the
+log (`70.0 MiB (73,400,320 bytes)`, and just `70.0 MiB` in the per-deployment
+table); the `bytes-uploaded` output stays a plain integer for machines.
 
 ## Complete input reference
 
@@ -318,6 +440,7 @@ small; the advanced knobs moved into the config file (see
 | `password`, `private-key`, `passphrase` | both | Credentials (always from secrets). |
 | `host-key`, `known-hosts`, `allow-any-host-key` | inline | Host key verification. |
 | `source`, `target`, `mode`, `exclude` | inline | The single deployment. |
+| `file-mode`, `dir-mode`, `preserve-times` | inline | Remote permissions and timestamps (`permissions.*` in config mode). |
 | `config` | config | Path to the version-3 config file. |
 | `proxy-password`, `proxy-private-key`, `proxy-passphrase` | config | Jump-host credentials (the rest of the proxy config is in the file). |
 | `dry-run`, `log-level` | both | Run-wide switches. |
@@ -325,8 +448,8 @@ small; the advanced knobs moved into the config file (see
 Removed v2 inputs (`server`, `uploads`, `strategy`, `ignore`, `ignore-from`,
 `config-file`, `host-key-fingerprint`, `max-deletes`, `concurrency`,
 `sftp-request-concurrency`, `retries`, `timeout`, `stall-timeout`,
-`sync-fast-path`, `skip-unchanged`, `manifest-name`, `dir-mode`, `file-mode`,
-`preserve-times`, the `proxy-server`/`proxy-port`/`proxy-username`/
+`sync-fast-path`, `skip-unchanged`, `manifest-name`,
+the `proxy-server`/`proxy-port`/`proxy-username`/
 `proxy-host-key-fingerprint`/`proxy-known-hosts` connection inputs,
 `build-mode`, and the `delete` tombstone) still fail loudly with a migration
 hint rather than being silently ignored. See the

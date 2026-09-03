@@ -3,9 +3,11 @@ package config
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 )
 
@@ -26,13 +28,21 @@ type yamlConfig struct {
 }
 
 type yamlConnection struct {
-	Host            string     `yaml:"host"`
-	Port            int        `yaml:"port"`
-	Username        string     `yaml:"username"`
-	HostKey         string     `yaml:"host_key"`
-	KnownHosts      string     `yaml:"known_hosts"`
-	AllowAnyHostKey bool       `yaml:"allow_any_host_key"`
-	Proxy           *yamlProxy `yaml:"proxy"`
+	Host            string         `yaml:"host"`
+	Port            int            `yaml:"port"`
+	Username        string         `yaml:"username"`
+	HostKey         string         `yaml:"host_key"`
+	KnownHosts      string         `yaml:"known_hosts"`
+	AllowAnyHostKey bool           `yaml:"allow_any_host_key"`
+	Algorithms      yamlAlgorithms `yaml:"algorithms"`
+	Proxy           *yamlProxy     `yaml:"proxy"`
+}
+
+type yamlAlgorithms struct {
+	KeyExchanges      []string `yaml:"key_exchanges"`
+	Ciphers           []string `yaml:"ciphers"`
+	MACs              []string `yaml:"macs"`
+	HostKeyAlgorithms []string `yaml:"host_key_algorithms"`
 }
 
 type yamlProxy struct {
@@ -68,7 +78,9 @@ type yamlAdvanced struct {
 	StallTimeout       *int    `yaml:"stall_timeout"`
 	Concurrency        autoInt `yaml:"concurrency"`
 	RequestConcurrency autoInt `yaml:"request_concurrency"`
+	Connections        autoInt `yaml:"connections"`
 	SkipUnchanged      bool    `yaml:"skip_unchanged"`
+	AutoCache          string  `yaml:"auto_cache"`
 }
 
 type yamlPermissions struct {
@@ -83,7 +95,9 @@ type yamlSync struct {
 }
 
 // autoInt is an integer that also accepts the literal "auto" (or being
-// absent), both meaning "let easySFTP pick the default".
+// absent), both meaning "let easySFTP work the value out for itself". What
+// that resolves to is internal/autotune's job, per deployment and per link;
+// this type only records which of the two the user wrote.
 type autoInt struct {
 	set bool
 	v   int
@@ -100,7 +114,9 @@ func (a *autoInt) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// or returns the configured value, or def when unset/"auto".
+// or returns the configured value, or def when unset/"auto". def is the
+// pre-adaptive fixed default, which the run carries only until the policy
+// replaces it; auto reports which of the two happened.
 func (a autoInt) or(def int) int {
 	if a.set {
 		return a.v
@@ -108,20 +124,24 @@ func (a autoInt) or(def int) int {
 	return def
 }
 
+// auto reports whether easySFTP chooses this value.
+func (a autoInt) auto() bool { return !a.set }
+
 // allowedKeys lists the valid option names per config-file section, keyed by
 // the section's dotted path ("" is the file's top level, "deployments.*" any
 // named deployment). checkKeys walks the raw YAML against it so a typo fails
 // with a suggestion instead of a silent no-op or a cryptic decoder error.
 var allowedKeys = map[string][]string{
-	"":                 {"version", "connection", "defaults", "deployments", "safety", "advanced", "permissions", "sync"},
-	"connection":       {"host", "port", "username", "host_key", "known_hosts", "allow_any_host_key", "proxy"},
-	"connection.proxy": {"host", "port", "username", "host_key", "known_hosts", "allow_any_host_key"},
-	"defaults":         {"mode", "exclude"},
-	"deployments.*":    {"source", "target", "mode", "exclude"},
-	"safety":           {"max_deletes"},
-	"advanced":         {"retries", "timeout", "stall_timeout", "concurrency", "request_concurrency", "skip_unchanged"},
-	"permissions":      {"files", "directories", "preserve_times"},
-	"sync":             {"fast_path", "manifest"},
+	"":                      {"version", "connection", "defaults", "deployments", "safety", "advanced", "permissions", "sync"},
+	"connection":            {"host", "port", "username", "host_key", "known_hosts", "allow_any_host_key", "algorithms", "proxy"},
+	"connection.algorithms": {"key_exchanges", "ciphers", "macs", "host_key_algorithms"},
+	"connection.proxy":      {"host", "port", "username", "host_key", "known_hosts", "allow_any_host_key"},
+	"defaults":              {"mode", "exclude"},
+	"deployments.*":         {"source", "target", "mode", "exclude"},
+	"safety":                {"max_deletes"},
+	"advanced":              {"retries", "timeout", "stall_timeout", "concurrency", "request_concurrency", "connections", "skip_unchanged", "auto_cache"},
+	"permissions":           {"files", "directories", "preserve_times"},
+	"sync":                  {"fast_path", "manifest"},
 }
 
 // checkKeys validates every mapping key in the file against allowedKeys and
@@ -268,6 +288,10 @@ func applyYAML(cfg *Config, yc *yamlConfig) error {
 	cfg.HostKeyFingerprints = splitLines(conn.HostKey)
 	cfg.KnownHosts = strings.TrimSpace(conn.KnownHosts)
 	cfg.AllowAnyHostKey = conn.AllowAnyHostKey
+	var err error
+	if cfg.Algorithms, err = parseSSHAlgorithms(conn.Algorithms); err != nil {
+		return err
+	}
 	if p := conn.Proxy; p != nil {
 		proxy := &Proxy{
 			Server:              strings.TrimSpace(p.Host),
@@ -334,7 +358,7 @@ func applyYAML(cfg *Config, yc *yamlConfig) error {
 	}
 
 	// Safety, advanced tuning, permissions, sync.
-	cfg.Guards.MaxDeletes = yc.Safety.MaxDeletes
+	cfg.Safety.MaxDeletes = yc.Safety.MaxDeletes
 	if yc.Advanced.Retries != nil {
 		cfg.Retries = *yc.Advanced.Retries
 	}
@@ -346,9 +370,19 @@ func applyYAML(cfg *Config, yc *yamlConfig) error {
 	}
 	cfg.Concurrency = yc.Advanced.Concurrency.or(defaultConcurrency)
 	cfg.SftpRequestConcurrency = yc.Advanced.RequestConcurrency.or(defaultRequestConcurrency)
+	cfg.Connections = yc.Advanced.Connections.or(defaultConnections)
+	// Each key is resolved on its own: a file that pins connections and
+	// leaves concurrency at auto gets exactly that, and the policy then
+	// chooses the concurrency knowing the connection count it has to live
+	// with (issue #209).
+	cfg.Auto = AutoSettings{
+		Connections:        yc.Advanced.Connections.auto(),
+		Concurrency:        yc.Advanced.Concurrency.auto(),
+		RequestConcurrency: yc.Advanced.RequestConcurrency.auto(),
+	}
 	cfg.SkipUnchanged = yc.Advanced.SkipUnchanged
+	cfg.AutoCachePath = strings.TrimSpace(yc.Advanced.AutoCache)
 
-	var err error
 	if cfg.FileMode, err = parseMode(yc.Permissions.Files, "permissions.files"); err != nil {
 		return err
 	}
@@ -362,4 +396,46 @@ func applyYAML(cfg *Config, yc *yamlConfig) error {
 		return err
 	}
 	return nil
+}
+
+func parseSSHAlgorithms(y yamlAlgorithms) (SSHAlgorithms, error) {
+	supported := ssh.SupportedAlgorithms()
+	insecure := ssh.InsecureAlgorithms()
+	var out SSHAlgorithms
+
+	categories := []struct {
+		name        string
+		requested   []string
+		supported   []string
+		insecure    []string
+		destination *[]string
+	}{
+		{"key_exchanges", y.KeyExchanges, supported.KeyExchanges, insecure.KeyExchanges, &out.KeyExchanges},
+		{"ciphers", y.Ciphers, supported.Ciphers, insecure.Ciphers, &out.Ciphers},
+		{"macs", y.MACs, supported.MACs, insecure.MACs, &out.MACs},
+		{"host_key_algorithms", y.HostKeyAlgorithms, supported.HostKeys, insecure.HostKeys, &out.HostKeyAlgorithms},
+	}
+
+	for _, category := range categories {
+		seen := map[string]bool{}
+		for _, raw := range category.requested {
+			name := strings.TrimSpace(raw)
+			path := "connection.algorithms." + category.name
+			if name == "" {
+				return SSHAlgorithms{}, fmt.Errorf("'%s' contains an empty algorithm name", path)
+			}
+			if !slices.Contains(category.supported, name) && !slices.Contains(category.insecure, name) {
+				return SSHAlgorithms{}, fmt.Errorf("'%s' contains unsupported SSH algorithm %q", path, name)
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			*category.destination = append(*category.destination, name)
+			if slices.Contains(category.insecure, name) && !slices.Contains(out.Insecure, name) {
+				out.Insecure = append(out.Insecure, name)
+			}
+		}
+	}
+	return out, nil
 }

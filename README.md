@@ -58,11 +58,11 @@ with `allow-any-host-key: true`, but that allows man-in-the-middle attacks.)
 ## Why easySFTP?
 
 I needed an SFTP upload step for a GitHub Actions deploy, and none of the
-existing options really fit. They were either no longer actively maintained,
-not resource-friendly, hard or barely configurable, or they simply did not work
-reliably. So I built my own and made it available for everyone with the same
-problem: an action that stays out of your way for the simple case and still
-handles the complex ones.
+existing options really fit. None of them verified the host key, none of them
+guarded a delete, and the ones that could skip unchanged files could not also
+run on a Windows runner. So I built my own and made it available for everyone
+with the same problem: an action that stays out of your way for the simple case
+and still handles the complex ones.
 
 Here is how easySFTP compares to other open-source actions that tackle the same
 job:
@@ -78,17 +78,22 @@ job:
 | Delete removed files | yes (tracked, via sync) | yes (full wipe) | yes | yes (full wipe) | yes (tracked) |
 | Delete safety guards | yes (root refusal, max_deletes) | no | no | no | no |
 | Multiple targets / modes | yes (config file) | multiple mappings | single directory | single directory | single directory |
-| Dry run | yes | no | yes | no | no |
-| Actively maintained | yes | last release 2024 | yes | yes | yes |
+| Dry run | yes | yes | yes | no | no |
 
-The matrix reflects each project's public documentation as of July 2026.
+The matrix reflects each project's public documentation as of August 2026.
 "Not documented" means the feature was not found in that action's README, not
 that it is impossible. SamKirkland's FTP-Deploy-Action is by far the most
 popular deploy action, but it speaks FTP/FTPS rather than SFTP, so it is listed
 for context rather than as a direct SFTP alternative.
 
-easySFTP is a clean, from-scratch implementation in Go, inspired by the
-no-longer-maintained [Dylan700/sftp-upload-action][dylan]:
+The matrix deliberately carries no "actively maintained" row. Feature rows age
+slowly and a maintenance row ages in weeks, so it is the one cell most likely
+to be wrong when you read it. Each project's releases page answers that
+question better than this table can: [Dylan700][dylan-rel], [SamKirkland][sam-rel],
+[wlixcc][wlixcc-rel], [wangyucode][wang-rel].
+
+easySFTP is a clean, from-scratch implementation in Go, inspired by
+[Dylan700/sftp-upload-action][dylan]:
 
 - compiled static binary instead of a Node.js runtime (fast startup, parallel transfers)
 - works on Linux, macOS **and** Windows runners, with no Docker required
@@ -97,10 +102,17 @@ no-longer-maintained [Dylan700/sftp-upload-action][dylan]:
 - end-to-end test suite against an in-process SFTP server, plus a CI self-test
   against a real OpenSSH server
 
+Coming from it? [docs/migration.md](docs/migration.md) maps every input and
+shows a before/after workflow.
+
 [dylan]: https://github.com/Dylan700/sftp-upload-action
 [sam]: https://github.com/SamKirkland/FTP-Deploy-Action
 [wlixcc]: https://github.com/wlixcc/SFTP-Deploy-Action
 [wang]: https://github.com/wangyucode/sftp-upload-action
+[dylan-rel]: https://github.com/Dylan700/sftp-upload-action/releases
+[sam-rel]: https://github.com/SamKirkland/FTP-Deploy-Action/releases
+[wlixcc-rel]: https://github.com/wlixcc/SFTP-Deploy-Action/releases
+[wang-rel]: https://github.com/wangyucode/sftp-upload-action/releases
 
 ## Inputs & outputs
 
@@ -118,8 +130,8 @@ Inline mode uses a small, self-explanatory set of inputs:
 | `dry-run` | `false` | Log what would happen, change nothing. |
 | `log-level` | `normal` | `normal`, `verbose` (per-file lines) or `debug` (exclude decisions). |
 
-Outputs: `files-uploaded`, `files-deleted`, `files-skipped`, `bytes-uploaded`,
-`duration-ms`, plus a summary table in the job summary. If a transfer fails
+Outputs: `files-uploaded`, `files-deleted`, `dirs-deleted`, `files-skipped`,
+`bytes-uploaded`, `duration-ms`, plus a summary table in the job summary. If a transfer fails
 partway, the outputs contain the progress completed before the failure and the
 summary is marked as failed.
 
@@ -137,8 +149,8 @@ summary is marked as failed.
 `sync` is manifest-based: it only ever deletes files it uploaded itself, skips
 unchanged files by content hash, and only transfers what changed on re-deploys.
 Destructive modes are protected by [delete guards](docs/strategies.md#delete-guards):
-the remote root is always refused, and `max_deletes` caps how much a single run
-may delete. Preview anything with `dry-run: true`.
+the remote root is always refused, and `max_deletes` caps how many remote
+entries (files and directories) the whole run may delete. Preview anything with `dry-run: true`.
 
 ➡ Details, manifest semantics and guard rules: [docs/strategies.md](docs/strategies.md)
 
@@ -180,7 +192,7 @@ deployments:
     mode: clean
 ```
 
-The config file supports named deployments, per-target modes and excludes,
+The config file supports named deployments, per-deployment modes and excludes,
 proxy/bastion connections, delete guards, permissions, retries/timeouts,
 performance tuning and sync-manifest settings. A JSON Schema for editor
 autocomplete/validation is bundled. See

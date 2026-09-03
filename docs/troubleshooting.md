@@ -4,6 +4,12 @@ Common errors, what they mean and how to fix them. If your problem is not
 listed, [open an issue](https://github.com/eiserv/easySFTP/issues), ideally
 with the log of a `dry-run: true` run.
 
+Ports, chrooted paths and "SSH has to be enabled first" are usually not
+errors but provider quirks: see [Provider notes](providers.md), which also
+explains how to find your own port, path and host key in three commands, and
+lists [what easySFTP needs from a server](providers.md#what-easysftp-needs-from-a-server)
+if yours is not OpenSSH.
+
 ## Action startup problems
 
 ### `the '<x>' input was ... in easySFTP v3`
@@ -30,6 +36,25 @@ release; do not bypass checksum verification.
 
 ## Connection problems
 
+### `ssh: handshake failed: no common algorithm ...`
+
+The server and easySFTP could not agree on a key exchange, cipher, MAC, or
+host-key signature algorithm. This commonly means the server offers only an
+obsolete algorithm. Upgrading the SSH server is the safest fix. When that is
+not possible, config mode has an explicit additive escape hatch:
+
+```yaml
+connection:
+  algorithms:
+    key_exchanges: [diffie-hellman-group1-sha1] # example only
+```
+
+The error normally names the missing category and the server's algorithm.
+Configure only that category and value. Unknown algorithms are rejected;
+algorithms classified as insecure by the bundled SSH library produce a
+warning and are listed in the job summary. The same additions are offered to
+an optional proxy hop, with modern algorithms retained ahead of them.
+
 ### `connecting to <host>:22: dial tcp ...: i/o timeout`
 
 The runner cannot reach the server.
@@ -51,14 +76,34 @@ This is automatic and not configurable. If transfers still die mid-run, the
 connection itself is being reset (not just idled out); check for a very
 short server-side session/idle limit, or a flaky network path.
 
+### `the server would not open more than N SSH connection(s)`
+
+easySFTP sizes its connection pool itself (see [transfer tuning](tuning.md)),
+and this host allows fewer connections per account than it asked for. sshd's
+`MaxStartups` and the per-account limits of shared hosting are the usual
+reasons.
+
+It is a degradation, not a failure: the deploy finishes on the connections it
+has, and easySFTP stops asking for more for the rest of the run. If you see it
+on every deploy, pin the number your host allows and the warning goes away:
+
+```yaml
+advanced:
+  connections: 1
+```
+
+The other two settings stay adaptive; each one is resolved on its own.
+
 ### `connecting to <host>:22: ssh: handshake failed: ... unable to authenticate`
 
 The server rejected the credentials.
 
 - Verify the secret names in your workflow match the configured secrets
   (a missing secret silently expands to an empty string).
-- Password auth: some servers disable it entirely (`PasswordAuthentication no`);
-  use a key instead.
+- A configured password is offered through both SSH password authentication
+  and a single hidden keyboard-interactive prompt. Servers that require an
+  additional interactive secret such as a TOTP code cannot be used from an
+  unattended job; use a deploy key or a dedicated CI account instead.
 - Key auth: the key must be in OpenSSH or PEM format. If it is encrypted, set
   `passphrase`. Check that the *public* key is in the server's
   `authorized_keys`.
@@ -100,30 +145,94 @@ The SFTP user cannot write to the target directory. Check ownership and
 permissions on the server. With chrooted SFTP setups remember that paths are
 relative to the chroot: `/upload/...`, not `/home/user/upload/...`.
 
+### Which upload failures easySFTP retries
+
+A failure the server itself reported reads like
+`sftp: "Disk quota exceeded" (SSH_FX_FAILURE)`. The quoted text is the server's
+own explanation and is usually the only part worth reading; the `SSH_FX_*` name
+after it is the protocol status code it sent, which decides whether easySFTP
+tries again.
+
+Codes that can only ever come back the same way fail the file immediately,
+whatever `retries` is set to: `SSH_FX_NO_SUCH_FILE` and
+`SSH_FX_PERMISSION_DENIED` (which reach you as `file does not exist` and
+`permission denied`), plus `SSH_FX_OP_UNSUPPORTED` and `SSH_FX_BAD_MESSAGE`,
+whose failures add `retrying would not have helped` so the skipped retries are
+not a mystery.
+
+`SSH_FX_FAILURE` is retried, because it is a catch-all: servers use it both for
+permanent conditions (a disk quota, a full or read-only filesystem, a path
+length limit) and for transient ones, and only the message text tells them
+apart. easySFTP does not guess from that text, so a quota-exceeded deploy pays
+the retry backoff for the files it has in flight when the quota runs out
+(remaining files are not started once one fails). If you already know the cause
+is permanent, `advanced.retries: 0` in the config file makes such a run fail
+immediately.
+
 ### Site deploys "successfully" but returns 403s, or files land with the wrong owner-readable bits
 
 Directories created by the run get whatever the server's umask produces, and
 uploaded files mirror their local permission bits. On shared hosting where the
 web server runs as a different user than your SFTP account, that default can
-produce directories the web server can't read. Set `permissions.directories`
-(and, if needed, `permissions.files`) in the config file to force a known-good
-permission, e.g. `directories: "0755"` and `files: "0644"`. Both are
-best-effort; see [configuration.md](configuration.md#permissions).
+produce directories the web server can't read. Force a known-good permission
+with the `dir-mode` and `file-mode` inputs:
+
+```yaml
+    dir-mode: "0755"
+    file-mode: "0644"
+```
+
+In config mode the same settings are `permissions.directories` and
+`permissions.files`. Both are best-effort; see
+[configuration.md](configuration.md#permissions-inline-mode).
+
+Deploying from a **Windows runner** makes this more likely: Windows has no
+POSIX permission bits, so the mirrored local mode is `0666` for every writable
+file (`0444` for read-only ones), and your files land world-writable. Setting
+`file-mode` explicitly is the fix, and is worth doing even when the deploy
+appears to work.
 
 ### `replacing "<path>": ...` or leftover `.easysftp-tmp` files
 
 easySFTP uploads to a temporary sibling file (named `<path>.easysftp-tmp.<n>`)
-and renames it over the target (atomic on servers supporting the
-`posix-rename@openssh.com` extension, with a remove+rename fallback
-otherwise). A hard crash mid-upload can leave such a file behind; it is safe
-to delete manually. It usually gets overwritten by the next upload of the
-same file too, but that isn't guaranteed if the deployment's file set changed
-in the meantime and shifted its plan position.
+and renames it over the target. On a server supporting the
+`posix-rename@openssh.com` extension that rename is atomic. Without it, the
+live file is first moved aside to `<path>.easysftp-tmp.bak`, the upload is
+renamed into place, and the backup is removed; if the rename fails, the backup
+is put back, so a failed publish never costs you the file it was replacing.
+A hard kill mid-upload (a cancelled workflow past its grace period, a job
+timeout, a reclaimed runner) can leave either file behind; both are safe to
+delete manually.
+
+If **every** overwrite fails this way while new files upload fine, the server
+is refusing the rename rather than lacking the extension: easySFTP only falls
+back to the move-aside path on a server that does not offer atomic rename, and
+never removes a live file to retry a rename the server has already declined. Check
+write permissions on the existing target files and any policy on the server
+that forbids replacing them. See
+[what easySFTP needs from a server](providers.md#what-easysftp-needs-from-a-server).
+
+Later deploys clean these up automatically: before uploading, every run
+sweeps the directories receiving files in that run, plus the deployment's
+target directory itself, and removes temp files older than an hour (logged
+as `removed stale temporary file ...`). Nothing above the target directory
+is ever listed or touched. The age margin keeps the sweep from deleting a
+concurrently running deploy's in-progress upload. The sweep intentionally
+runs in every mode, `overlay` included, and is on by default: even though
+overlay never deletes your files, the sweep only ever removes the action's
+own `*.easysftp-tmp` / `*.easysftp-tmp.<n>` / `*.easysftp-tmp.bak` debris,
+never a file it did not name itself. A real file of yours that happens to carry such a name is part
+of the deployment and is therefore never swept, in `sync` too, where it is
+protected even on runs that leave it unchanged. An orphan in a directory
+that no later deploy uploads into
+stays until one does, or until you delete it manually. If the target is a
+public web root, also add a deny rule for these names next to the manifest
+rule; see [security.md](security.md#temporary-upload-files-in-web-roots).
 
 ### Ignored files are uploaded anyway / patterns don't match
 
 - Patterns match against the path **relative to the local root of each
-  target**, not the repository root.
+  deployment**, not the repository root.
 - Directory patterns need a trailing slash (`node_modules/`), just like
   gitignore.
 - Test your patterns cheaply with `dry-run: true`.
@@ -134,8 +243,8 @@ Symlinks, sockets and other non-regular files are skipped by design. SFTP
 uploads regular file content. If your build output contains symlinks (e.g.
 pnpm's `node_modules`), upload a bundled/dereferenced build instead.
 
-When a target has any non-regular files, the log shows one aggregated
-warning per target (not one per file), e.g.:
+When a deployment has any non-regular files, the log shows one aggregated
+warning per deployment (not one per file), e.g.:
 
 ```
 ::warning::skipped 37 non-regular file(s) (symlinks, sockets, …) under ./dist/: SFTP uploads regular files only
@@ -161,15 +270,28 @@ never deleted by `sync` itself.
 
 ### `refusing a destructive mode on remote root`
 
-`sync` and `clean` refuse to operate on `/` (or `.`) as the remote target,
-always. Deploy into a specific subdirectory instead. This guard cannot be
-disabled; see [delete guards](strategies.md#delete-guards).
+`sync` and `clean` refuse a remote target that resolves to `/`, `.`, `~` or
+the empty string, and one that climbs above the directory the session starts
+in (`..`, `../..`, `dist/../..`). Deploy into a specific subdirectory instead.
 
-### `refusing to delete N files: exceeds guards.max_deletes`
+If you did not write `..` anywhere, check how the target is built: an
+expression such as `${{ inputs.dir }}/..` lands here when `inputs.dir` is
+empty, and so does a path whose last component was stripped by a shell.
 
-Your run would delete more files than `safety.max_deletes` allows. Inspect the
-plan with `dry-run: true`; if the deletions are intended, raise (or remove)
-the limit in the config file.
+This guard cannot be disabled; see
+[delete guards](strategies.md#delete-guards).
+
+### `refusing to delete N remote entries: exceeds safety.max_deletes`
+
+Your run would remove more remote entries than `safety.max_deletes` allows.
+Inspect the plan with `dry-run: true`; if the deletions are intended, raise
+(or remove) the limit in the config file.
+
+Two things count towards the limit that its name does not spell out:
+**directories** as well as files, and **every deployment of the run**, not
+each one on its own. A variant of the message that says "N more remote
+entries: M were already deleted earlier in this run" is the second case: an
+earlier deployment used part of the budget.
 
 ## Configuration errors
 

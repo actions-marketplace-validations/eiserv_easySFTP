@@ -20,6 +20,7 @@ var v3EnvVars = []string{
 	"HOST", "PORT", "USERNAME", "PASSWORD", "PRIVATE_KEY", "PASSPHRASE",
 	"HOST_KEY", "KNOWN_HOSTS", "ALLOW_ANY_HOST_KEY",
 	"SOURCE", "TARGET", "MODE", "EXCLUDE", "CONFIG",
+	"FILE_MODE", "DIR_MODE", "PRESERVE_TIMES",
 	"DRY_RUN", "LOG_LEVEL",
 	"PROXY_PASSWORD", "PROXY_PRIVATE_KEY", "PROXY_PASSPHRASE",
 	// removed-input tombstones
@@ -27,7 +28,6 @@ var v3EnvVars = []string{
 	"IGNORE", "IGNORE_FROM", "MAX_DELETES", "DELETE",
 	"CONCURRENCY", "SFTP_REQUEST_CONCURRENCY", "RETRIES", "TIMEOUT", "STALL_TIMEOUT",
 	"SYNC_FAST_PATH", "MANIFEST_NAME", "SKIP_UNCHANGED",
-	"DIR_MODE", "FILE_MODE", "PRESERVE_TIMES",
 	"PROXY_SERVER", "PROXY_PORT", "PROXY_USERNAME",
 	"PROXY_HOST_KEY_FINGERPRINT", "PROXY_KNOWN_HOSTS",
 }
@@ -84,15 +84,16 @@ func TestLoadInlineDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Port != 22 || cfg.Concurrency != 4 || cfg.SftpRequestConcurrency != 16 || cfg.Retries != 2 ||
-		cfg.DryRun || cfg.SyncFastPath || cfg.SkipUnchanged || cfg.AllowAnyHostKey || cfg.LogLevel != LogNormal {
+	if cfg.Port != 22 || cfg.Concurrency != 4 || cfg.SftpRequestConcurrency != 16 || cfg.Connections != 1 ||
+		cfg.Retries != 2 || cfg.DryRun || cfg.SyncFastPath || cfg.SkipUnchanged || cfg.AllowAnyHostKey ||
+		cfg.LogLevel != LogNormal {
 		t.Errorf("unexpected defaults: %+v", cfg)
 	}
 	if cfg.Timeout != 30*time.Second {
 		t.Errorf("expected 30s default timeout, got %s", cfg.Timeout)
 	}
-	if cfg.Guards.MaxDeletes != 0 {
-		t.Errorf("expected unlimited max deletes by default, got %d", cfg.Guards.MaxDeletes)
+	if cfg.Safety.MaxDeletes != 0 {
+		t.Errorf("expected unlimited max deletes by default, got %d", cfg.Safety.MaxDeletes)
 	}
 	if cfg.ManifestName != DefaultManifestName {
 		t.Errorf("expected default manifest name %q, got %q", DefaultManifestName, cfg.ManifestName)
@@ -127,6 +128,37 @@ func TestLoadInlineModeAndExclude(t *testing.T) {
 	}
 }
 
+// TestLoadInlinePermissions covers issue #133: the permission knobs are
+// settable inline, so a Windows deploy does not need a whole config file for
+// one "file-mode: 0644".
+func TestLoadInlinePermissions(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FileMode != nil || cfg.DirMode != nil || cfg.PreserveTimes {
+		t.Errorf("expected unset permissions by default, got files=%v dirs=%v times=%v",
+			cfg.FileMode, cfg.DirMode, cfg.PreserveTimes)
+	}
+
+	t.Setenv("EASYSFTP_FILE_MODE", "0644")
+	t.Setenv("EASYSFTP_DIR_MODE", "755")
+	t.Setenv("EASYSFTP_PRESERVE_TIMES", "true")
+	if cfg, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FileMode == nil || *cfg.FileMode != 0o644 {
+		t.Errorf("expected file mode 0644, got %v", cfg.FileMode)
+	}
+	if cfg.DirMode == nil || *cfg.DirMode != 0o755 {
+		t.Errorf("expected dir mode 0755, got %v", cfg.DirMode)
+	}
+	if !cfg.PreserveTimes {
+		t.Error("expected PreserveTimes to be true")
+	}
+}
+
 func TestLoadInlineValidation(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -143,6 +175,9 @@ func TestLoadInlineValidation(t *testing.T) {
 		{"bad dry-run", map[string]string{"EASYSFTP_DRY_RUN": "yes-please"}, "invalid dry-run"},
 		{"bad allow-any-host-key", map[string]string{"EASYSFTP_ALLOW_ANY_HOST_KEY": "maybe"}, "invalid allow-any-host-key"},
 		{"bad log-level", map[string]string{"EASYSFTP_LOG_LEVEL": "quiet"}, "'log-level' must be normal, verbose or debug"},
+		{"bad file-mode", map[string]string{"EASYSFTP_FILE_MODE": "rw-r--r--"}, "invalid input 'file-mode'"},
+		{"bad dir-mode", map[string]string{"EASYSFTP_DIR_MODE": "0999"}, "invalid input 'dir-mode'"},
+		{"bad preserve-times", map[string]string{"EASYSFTP_PRESERVE_TIMES": "sometimes"}, "invalid preserve-times"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -194,9 +229,6 @@ func TestLoadRemovedInputsFailWithMigrationHint(t *testing.T) {
 		{"SYNC_FAST_PATH", "sync.fast_path"},
 		{"MANIFEST_NAME", "sync.manifest"},
 		{"SKIP_UNCHANGED", "advanced.skip_unchanged"},
-		{"DIR_MODE", "permissions.directories"},
-		{"FILE_MODE", "permissions.files"},
-		{"PRESERVE_TIMES", "permissions.preserve_times"},
 		{"PROXY_SERVER", "connection.proxy.host"},
 		{"PROXY_PORT", "connection.proxy.port"},
 		{"PROXY_USERNAME", "connection.proxy.username"},
@@ -275,6 +307,7 @@ advanced:
   stall_timeout: 120
   concurrency: 8
   request_concurrency: 4
+  connections: 3
   skip_unchanged: true
 permissions:
   files: "0644"
@@ -314,11 +347,11 @@ sync:
 	if len(cfg.IgnoreLines) != 1 || cfg.IgnoreLines[0] != "*.map" {
 		t.Errorf("unexpected global excludes: %v", cfg.IgnoreLines)
 	}
-	if cfg.Guards.MaxDeletes != 500 {
-		t.Errorf("expected max_deletes 500, got %d", cfg.Guards.MaxDeletes)
+	if cfg.Safety.MaxDeletes != 500 {
+		t.Errorf("expected max_deletes 500, got %d", cfg.Safety.MaxDeletes)
 	}
 	if cfg.Retries != 4 || cfg.Timeout != 60*time.Second || cfg.StallTimeout != 120*time.Second ||
-		cfg.Concurrency != 8 || cfg.SftpRequestConcurrency != 4 || !cfg.SkipUnchanged {
+		cfg.Concurrency != 8 || cfg.SftpRequestConcurrency != 4 || cfg.Connections != 3 || !cfg.SkipUnchanged {
 		t.Errorf("unexpected advanced settings: %+v", cfg)
 	}
 	if cfg.FileMode == nil || *cfg.FileMode != 0o644 || cfg.DirMode == nil || *cfg.DirMode != 0o755 || !cfg.PreserveTimes {
@@ -335,8 +368,8 @@ func TestLoadConfigModeDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Port != 22 || cfg.Concurrency != 4 || cfg.SftpRequestConcurrency != 16 || cfg.Retries != 2 ||
-		cfg.Timeout != 30*time.Second || cfg.StallTimeout != 0 || cfg.Guards.MaxDeletes != 0 {
+	if cfg.Port != 22 || cfg.Concurrency != 4 || cfg.SftpRequestConcurrency != 16 || cfg.Connections != 1 ||
+		cfg.Retries != 2 || cfg.Timeout != 30*time.Second || cfg.StallTimeout != 0 || cfg.Safety.MaxDeletes != 0 {
 		t.Errorf("unexpected config-mode defaults: %+v", cfg)
 	}
 	if cfg.Uploads[0].Strategy != StrategyOverlay {
@@ -384,8 +417,131 @@ advanced:
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The int field keeps the pre-adaptive default as a fallback; what makes
+	// the setting adaptive is the flag next to it, which internal/autotune
+	// resolves per deployment (issue #209).
 	if cfg.Concurrency != 4 {
-		t.Errorf("expected 'auto' to resolve to the default concurrency, got %d", cfg.Concurrency)
+		t.Errorf("expected the fixed fallback to stay at 4, got %d", cfg.Concurrency)
+	}
+	if !cfg.Auto.Concurrency {
+		t.Error("'auto' must mark the concurrency as easySFTP's to choose")
+	}
+}
+
+// TestAutoIsPerSettingAndOptOut: each of the three transport settings resolves
+// on its own, so a config file may pin one and leave the others adaptive
+// (issue #209, "Manual override semantics"). Not writing a key at all means
+// the same as writing "auto".
+func TestAutoIsPerSettingAndOptOut(t *testing.T) {
+	const header = `version: 3
+connection:
+  host: sftp.example.com
+  username: deploy
+  host_key: SHA256:abc
+deployments:
+  website:
+    source: ./dist/
+    target: /www/
+`
+	for _, tc := range []struct {
+		name     string
+		advanced string
+		want     AutoSettings
+		values   [3]int // connections, concurrency, request_concurrency
+	}{
+		{
+			name: "nothing written is fully adaptive",
+			want: AutoSettings{Connections: true, Concurrency: true, RequestConcurrency: true},
+			// The fixed fallbacks the run carries until the policy replaces them.
+			values: [3]int{1, 4, 16},
+		},
+		{
+			name: "auto written out is the same thing",
+			advanced: `advanced:
+  connections: auto
+  concurrency: auto
+  request_concurrency: auto
+`,
+			want:   AutoSettings{Connections: true, Concurrency: true, RequestConcurrency: true},
+			values: [3]int{1, 4, 16},
+		},
+		{
+			name: "the mixed example from the issue",
+			advanced: `advanced:
+  connections: auto
+  concurrency: auto
+  request_concurrency: 32
+`,
+			want:   AutoSettings{Connections: true, Concurrency: true},
+			values: [3]int{1, 4, 32},
+		},
+		{
+			name: "a pinned pool with the rest adaptive",
+			advanced: `advanced:
+  connections: 2
+`,
+			want:   AutoSettings{Concurrency: true, RequestConcurrency: true},
+			values: [3]int{2, 4, 16},
+		},
+		{
+			name: "everything pinned",
+			advanced: `advanced:
+  connections: 2
+  concurrency: 8
+  request_concurrency: 4
+`,
+			want:   AutoSettings{},
+			values: [3]int{2, 8, 4},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setConfigModeEnv(t, header+tc.advanced)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Auto != tc.want {
+				t.Errorf("Auto = %+v, want %+v", cfg.Auto, tc.want)
+			}
+			got := [3]int{cfg.Connections, cfg.Concurrency, cfg.SftpRequestConcurrency}
+			if got != tc.values {
+				t.Errorf("values = %v, want %v", got, tc.values)
+			}
+		})
+	}
+}
+
+// TestInlineModeIsFullyAdaptive: inline mode has no input for any of the three
+// (every non-secret setting has exactly one home in v3), so a workflow that
+// writes source/target gets the adaptive behaviour without asking for it.
+func TestInlineModeIsFullyAdaptive(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := AutoSettings{Connections: true, Concurrency: true, RequestConcurrency: true}
+	if cfg.Auto != want {
+		t.Errorf("Auto = %+v, want %+v", cfg.Auto, want)
+	}
+}
+
+func TestLoadConfigModeRejectsZeroConnections(t *testing.T) {
+	setConfigModeEnv(t, `version: 3
+connection:
+  host: sftp.example.com
+  username: deploy
+  host_key: SHA256:abc
+deployments:
+  website:
+    source: ./dist/
+    target: /www/
+advanced:
+  connections: 0
+`)
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "advanced.connections must be at least 1") {
+		t.Fatalf("expected a connections validation error, got %v", err)
 	}
 }
 
@@ -401,6 +557,9 @@ func TestLoadConfigModeRejectsInlineInputs(t *testing.T) {
 		{"EASYSFTP_ALLOW_ANY_HOST_KEY", "allow-any-host-key"},
 		{"EASYSFTP_USERNAME", "username"},
 		{"EASYSFTP_PORT", "port"},
+		{"EASYSFTP_FILE_MODE", "file-mode"},
+		{"EASYSFTP_DIR_MODE", "dir-mode"},
+		{"EASYSFTP_PRESERVE_TIMES", "preserve-times"},
 	} {
 		t.Run(in.name, func(t *testing.T) {
 			setConfigModeEnv(t, minimalConfigFile)

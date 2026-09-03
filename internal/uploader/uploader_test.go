@@ -130,7 +130,7 @@ func TestUploadDirectoryWithIgnore(t *testing.T) {
 	}
 }
 
-func TestMultiTargetStatsBreakdown(t *testing.T) {
+func TestMultiDeploymentStatsBreakdown(t *testing.T) {
 	srv := startTestServer(t)
 
 	siteLocal := t.TempDir()
@@ -154,40 +154,40 @@ func TestMultiTargetStatsBreakdown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(stats.Targets) != 2 {
-		t.Fatalf("expected 2 target entries, got %d: %+v", len(stats.Targets), stats.Targets)
+	if len(stats.Deployments) != 2 {
+		t.Fatalf("expected 2 deployment entries, got %d: %+v", len(stats.Deployments), stats.Deployments)
 	}
 
-	site, docs := stats.Targets[0], stats.Targets[1]
+	site, docs := stats.Deployments[0], stats.Deployments[1]
 	if site.Local != siteLocal || site.Remote != "/www/site" || site.Strategy != config.StrategyOverlay {
-		t.Errorf("unexpected site target stats: %+v", site)
+		t.Errorf("unexpected site deployment stats: %+v", site)
 	}
 	if site.FilesUploaded != 2 {
 		t.Errorf("expected 2 files uploaded for site, got %d", site.FilesUploaded)
 	}
 	if docs.Local != docsLocal || docs.Remote != "/www/docs" {
-		t.Errorf("unexpected docs target stats: %+v", docs)
+		t.Errorf("unexpected docs deployment stats: %+v", docs)
 	}
 	if docs.FilesUploaded != 1 {
 		t.Errorf("expected 1 file uploaded for docs, got %d", docs.FilesUploaded)
 	}
 
-	// Per-target totals must sum to the run-wide totals.
+	// Per-deployment totals must sum to the run-wide totals.
 	var sumUploaded int
 	var sumBytes int64
-	for _, ts := range stats.Targets {
-		sumUploaded += ts.FilesUploaded
-		sumBytes += ts.BytesUploaded
+	for _, ds := range stats.Deployments {
+		sumUploaded += ds.FilesUploaded
+		sumBytes += ds.BytesUploaded
 	}
 	if sumUploaded != stats.FilesUploaded {
-		t.Errorf("target FilesUploaded sum %d != total %d", sumUploaded, stats.FilesUploaded)
+		t.Errorf("deployment FilesUploaded sum %d != total %d", sumUploaded, stats.FilesUploaded)
 	}
 	if sumBytes != stats.BytesUploaded {
-		t.Errorf("target BytesUploaded sum %d != total %d", sumBytes, stats.BytesUploaded)
+		t.Errorf("deployment BytesUploaded sum %d != total %d", sumBytes, stats.BytesUploaded)
 	}
 }
 
-func TestSingleTargetStatsAreRecorded(t *testing.T) {
+func TestSingleDeploymentStatsAreRecorded(t *testing.T) {
 	srv := startTestServer(t)
 	local := t.TempDir()
 	writeTree(t, local, map[string]string{"index.html": "hi"})
@@ -199,8 +199,8 @@ func TestSingleTargetStatsAreRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(stats.Targets) != 1 || stats.Targets[0].Name != "website" || stats.Targets[0].FilesUploaded != 1 {
-		t.Errorf("expected one named target entry with 1 upload, got %+v", stats.Targets)
+	if len(stats.Deployments) != 1 || stats.Deployments[0].Name != "website" || stats.Deployments[0].FilesUploaded != 1 {
+		t.Errorf("expected one named deployment entry with 1 upload, got %+v", stats.Deployments)
 	}
 }
 
@@ -632,6 +632,53 @@ func TestFileModeFailureWarnsOnceNotPerFile(t *testing.T) {
 	}
 }
 
+// The two SETSTAT warn-once flags live in transferEnv, which is built per
+// deployment, so a multi-deployment run warns once per affected deployment and
+// the message says so instead of promising run-wide suppression (issue #121).
+func TestSetstatWarningsAreScopedPerDeployment(t *testing.T) {
+	srv := startTestServer(t, withFailSetstat())
+	first, second := t.TempDir(), t.TempDir()
+	writeTree(t, first, map[string]string{"a.txt": "1", "b.txt": "2"})
+	writeTree(t, second, map[string]string{"c.txt": "3", "d.txt": "4"})
+
+	mode := fs.FileMode(0o600)
+	cfg := baseConfig(srv)
+	cfg.FileMode = &mode
+	cfg.PreserveTimes = true
+	cfg.Uploads = []config.UploadPair{
+		{Name: "one", Local: first, Remote: "/www/one"},
+		{Name: "two", Local: second, Remote: "/www/two"},
+	}
+
+	log := &recordingLogger{testLogger: testLogger{t}}
+	if _, err := Run(context.Background(), cfg, log); err != nil {
+		t.Fatalf("rejected SETSTAT requests must not fail the run: %v", err)
+	}
+
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	counts := map[string]int{}
+	for _, w := range log.warnings {
+		switch {
+		case strings.Contains(w, "file-mode"):
+			counts["file-mode"]++
+		case strings.Contains(w, "preserve the modification time"):
+			counts["preserve-times"]++
+		default:
+			continue
+		}
+		if !strings.Contains(w, "not warning again for this deployment") {
+			t.Errorf("warning must scope its suppression promise to the deployment, got: %s", w)
+		}
+	}
+	for _, kind := range []string{"file-mode", "preserve-times"} {
+		if counts[kind] != len(cfg.Uploads) {
+			t.Errorf("expected %d %s warning(s) (one per deployment), got %d: %v",
+				len(cfg.Uploads), kind, counts[kind], log.warnings)
+		}
+	}
+}
+
 func TestDefaultModeMirrorsLocalBitsSilentlyOnFailure(t *testing.T) {
 	srv := startTestServer(t, withFailSetstat())
 	local := t.TempDir()
@@ -729,7 +776,7 @@ func TestSendKeepalivesPingsUntilCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		sendKeepalives(ctx, func() *ssh.Client { return sshClient }, 10*time.Millisecond)
+		sendKeepalives(ctx, func() []*ssh.Client { return []*ssh.Client{sshClient} }, 10*time.Millisecond)
 		close(done)
 	}()
 

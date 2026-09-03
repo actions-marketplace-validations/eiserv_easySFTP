@@ -11,6 +11,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/eiserv/easySFTP/internal/config"
+	"github.com/eiserv/easySFTP/internal/metrics"
 )
 
 // keepaliveInterval is how often sendKeepalives pings the connection. It is
@@ -19,22 +20,58 @@ import (
 // different value.
 const keepaliveInterval = 30 * time.Second
 
-// sendKeepalives periodically sends an SSH keepalive request until ctx is
-// canceled. This keeps long or idle-looking transfers alive across NAT
-// gateways and firewalls that drop idle TCP connections, and answers sshd's
-// own ClientAliveInterval probes so the server doesn't disconnect us first.
-// client is a getter (not a fixed *ssh.Client) so one loop follows the
-// session across reconnects; interval is a parameter so tests can drive it
-// with a short tick instead of waiting 30s.
-func sendKeepalives(ctx context.Context, client func() *ssh.Client, interval time.Duration) {
+// sendKeepalives periodically sends an SSH keepalive request on every live
+// connection until ctx is canceled. This keeps long or idle-looking transfers
+// alive across NAT gateways and firewalls that drop idle TCP connections, and
+// answers sshd's own ClientAliveInterval probes so the server doesn't
+// disconnect us first. clients is a getter (not a fixed slice) so one loop
+// follows the session across reconnects and picks up connections the pool
+// opens later; interval is a parameter so tests can drive it with a short tick
+// instead of waiting 30s.
+func sendKeepalives(ctx context.Context, clients func() []*ssh.Client, interval time.Duration) {
+	keepaliveLoop(ctx, func() []keepaliveSender {
+		live := clients()
+		senders := make([]keepaliveSender, len(live))
+		for i, client := range live {
+			senders[i] = client
+		}
+		return senders
+	}, interval)
+}
+
+type keepaliveSender interface {
+	SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error)
+}
+
+// keepaliveLoop decouples every connection from every other one. A keepalive
+// is advisory and does not need a reply; sending concurrently means a wedged
+// transport cannot prevent healthy pool members from being pinged. At most one
+// request per connection may be in flight, which also bounds blocked workers.
+func keepaliveLoop(ctx context.Context, clients func() []keepaliveSender, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	done := make(chan keepaliveSender)
+	inFlight := make(map[keepaliveSender]struct{})
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case client := <-done:
+			delete(inFlight, client)
 		case <-t.C:
-			_, _, _ = client().SendRequest("keepalive@openssh.com", true, nil)
+			for _, client := range clients() {
+				if _, busy := inFlight[client]; busy {
+					continue
+				}
+				inFlight[client] = struct{}{}
+				go func(client keepaliveSender) {
+					_, _, _ = client.SendRequest("keepalive@openssh.com", false, nil)
+					select {
+					case done <- client:
+					case <-ctx.Done():
+					}
+				}(client)
+			}
 		}
 	}
 }
@@ -62,6 +99,7 @@ type hop struct {
 	fingerprints    []string
 	knownHosts      string
 	allowAnyHostKey bool
+	algorithms      config.SSHAlgorithms
 	names           hopNames
 }
 
@@ -78,12 +116,51 @@ func (h hop) clientConfig(timeout time.Duration, log Logger) (*ssh.ClientConfig,
 	if err != nil {
 		return nil, permanentError{err}
 	}
-	return &ssh.ClientConfig{
+	client := &ssh.ClientConfig{
 		User:            h.user,
 		Auth:            auth,
 		HostKeyCallback: cb,
 		Timeout:         timeout,
-	}, nil
+	}
+	applySSHAlgorithms(client, h.algorithms)
+	return client, nil
+}
+
+// applySSHAlgorithms keeps x/crypto/ssh's defaults for every category the
+// user did not mention. A mentioned category starts with every supported safe
+// algorithm, in library preference order, and appends the requested values.
+// The parser has already rejected unknown names and recorded insecure ones.
+func applySSHAlgorithms(client *ssh.ClientConfig, additions config.SSHAlgorithms) {
+	supported := ssh.SupportedAlgorithms()
+	if len(additions.KeyExchanges) > 0 {
+		client.KeyExchanges = appendAlgorithms(supported.KeyExchanges, additions.KeyExchanges)
+	}
+	if len(additions.Ciphers) > 0 {
+		client.Ciphers = appendAlgorithms(supported.Ciphers, additions.Ciphers)
+	}
+	if len(additions.MACs) > 0 {
+		client.MACs = appendAlgorithms(supported.MACs, additions.MACs)
+	}
+	if len(additions.HostKeyAlgorithms) > 0 {
+		client.HostKeyAlgorithms = appendAlgorithms(supported.HostKeys, additions.HostKeyAlgorithms)
+	}
+}
+
+func appendAlgorithms(base, additions []string) []string {
+	out := append([]string(nil), base...)
+	for _, addition := range additions {
+		found := false
+		for _, existing := range out {
+			if existing == addition {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, addition)
+		}
+	}
+	return out
 }
 
 // targetHop maps the primary connection settings onto a hop.
@@ -102,12 +179,13 @@ func targetHop(cfg *config.Config) hop {
 		fingerprints:    cfg.HostKeyFingerprints,
 		knownHosts:      cfg.KnownHosts,
 		allowAnyHostKey: cfg.AllowAnyHostKey,
+		algorithms:      cfg.Algorithms,
 		names:           names,
 	}
 }
 
 // jumpHop maps the connection.proxy settings onto a hop.
-func jumpHop(p *config.Proxy) hop {
+func jumpHop(p *config.Proxy, algorithms config.SSHAlgorithms) hop {
 	return hop{
 		addr:            net.JoinHostPort(p.Server, fmt.Sprintf("%d", p.Port)),
 		user:            p.Username,
@@ -117,6 +195,7 @@ func jumpHop(p *config.Proxy) hop {
 		fingerprints:    p.HostKeyFingerprints,
 		knownHosts:      p.KnownHosts,
 		allowAnyHostKey: p.AllowAnyHostKey,
+		algorithms:      algorithms,
 		names: hopNames{hostKey: "connection.proxy.host_key", knownHosts: "connection.proxy.known_hosts",
 			allowAny: "connection.proxy.allow_any_host_key", privateKey: "proxy-private-key"},
 	}
@@ -135,7 +214,10 @@ func logHostKeyStatus(h hop, log Logger) {
 // opens an SFTP session on top of SSH. The returned cleanup function closes
 // the jump-host transport (it is a no-op for direct connections) and must be
 // called after the SSH client is closed.
-func connect(cfg *config.Config, log Logger) (*ssh.Client, *sftp.Client, func(), error) {
+// requests is the resolved advanced.request_concurrency: pkg/sftp fixes it
+// when the client is created, which is why it is a parameter here rather than
+// read off the config (see internal/uploader/tuning.go).
+func connect(cfg *config.Config, requests int, log Logger) (*ssh.Client, *sftp.Client, func(), error) {
 	noop := func() {}
 	target := targetHop(cfg)
 	targetConfig, err := target.clientConfig(cfg.Timeout, log)
@@ -147,7 +229,7 @@ func connect(cfg *config.Config, log Logger) (*ssh.Client, *sftp.Client, func(),
 	cleanup := noop
 	if cfg.Proxy == nil {
 		log.Infof("connecting to %s as %s ...", target.addr, target.user)
-		sshClient, err = ssh.Dial("tcp", target.addr, targetConfig)
+		sshClient, err = dialSSH(target.addr, targetConfig)
 		if err != nil {
 			return nil, nil, noop, fmt.Errorf("connecting to %s: %w", target.addr, err)
 		}
@@ -161,7 +243,7 @@ func connect(cfg *config.Config, log Logger) (*ssh.Client, *sftp.Client, func(),
 
 	sftpClient, err := sftp.NewClient(sshClient,
 		sftp.UseConcurrentWrites(true),
-		sftp.MaxConcurrentRequestsPerFile(cfg.SftpRequestConcurrency),
+		sftp.MaxConcurrentRequestsPerFile(requests),
 	)
 	if err != nil {
 		sshClient.Close()
@@ -171,18 +253,41 @@ func connect(cfg *config.Config, log Logger) (*ssh.Client, *sftp.Client, func(),
 	return sshClient, sftpClient, cleanup, nil
 }
 
+// dialSSH is ssh.Dial, except that a benchmark run (metrics enabled) gets the
+// transport wrapped in a byte counter first, which is the only way to see what
+// the SSH framing adds on top of the payload. A normal run takes the plain
+// ssh.Dial path and is bit for bit what it was before the counter existed:
+// this must not put a wrapper into every production transfer.
+func dialSSH(addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	if !metrics.Enabled() {
+		return ssh.Dial("tcp", addr, cfg)
+	}
+	// Mirrors ssh.Dial: the config timeout covers the TCP dial, the handshake
+	// deadline handling stays inside ssh.NewClientConn.
+	c, err := net.DialTimeout("tcp", addr, cfg.Timeout)
+	if err != nil {
+		return nil, err
+	}
+	ncc, chans, reqs, err := ssh.NewClientConn(metrics.CountConn(c), addr, cfg)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	return ssh.NewClient(ncc, chans, reqs), nil
+}
+
 // dialViaJump connects to the jump host with its own auth and host key
 // verification, opens a TCP tunnel to the target through it, and runs the
 // target's SSH handshake (with the target's own host key verification) over
 // that tunnel. The returned cleanup closes the jump transport.
 func dialViaJump(cfg *config.Config, targetAddr string, targetConfig *ssh.ClientConfig, log Logger) (*ssh.Client, func(), error) {
-	jump := jumpHop(cfg.Proxy)
+	jump := jumpHop(cfg.Proxy, cfg.Algorithms)
 	jumpConfig, err := jump.clientConfig(cfg.Timeout, log)
 	if err != nil {
 		return nil, nil, err
 	}
 	log.Infof("connecting to jump host %s as %s ...", jump.addr, jump.user)
-	jumpClient, err := ssh.Dial("tcp", jump.addr, jumpConfig)
+	jumpClient, err := dialSSH(jump.addr, jumpConfig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to jump host %s: %w", jump.addr, err)
 	}
@@ -220,6 +325,43 @@ func authMethods(h hop) ([]ssh.AuthMethod, error) {
 	}
 	if h.password != "" {
 		methods = append(methods, ssh.Password(h.password))
+		methods = append(methods, ssh.KeyboardInteractive(passwordChallenge(h.password)))
 	}
 	return methods, nil
+}
+
+// passwordChallenge covers servers that disable the SSH "password" method
+// but ask for the same password through keyboard-interactive. A single round
+// may include visible informational questions; those receive an empty answer
+// so a secret is never echoed. A second secret round is genuine interactive
+// authentication (commonly a TOTP prompt), which an unattended action cannot
+// satisfy safely.
+func passwordChallenge(password string) ssh.KeyboardInteractiveChallenge {
+	answeredSecret := false
+	return func(_ string, _ string, questions []string, echos []bool) ([]string, error) {
+		if len(questions) != len(echos) {
+			return nil, fmt.Errorf("keyboard-interactive authentication returned %d questions and %d echo flags", len(questions), len(echos))
+		}
+
+		answers := make([]string, len(questions))
+		secretQuestions := 0
+		for _, echo := range echos {
+			if !echo {
+				secretQuestions++
+			}
+		}
+		if secretQuestions == 0 {
+			return answers, nil
+		}
+		if answeredSecret || secretQuestions > 1 {
+			return nil, fmt.Errorf("server requested additional keyboard-interactive secrets; unattended easySFTP supports one password prompt only")
+		}
+		for i, echo := range echos {
+			if !echo {
+				answers[i] = password
+			}
+		}
+		answeredSecret = true
+		return answers, nil
+	}
 }

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,6 +31,7 @@ type testServer struct {
 	ClientKeyPEM  string
 	handlers      sftp.Handlers
 	sshConfig     *ssh.ServerConfig
+	hostSigner    ssh.Signer
 	listener      net.Listener
 
 	// Fault injection (set via options before the accept loop starts).
@@ -39,6 +42,8 @@ type testServer struct {
 	dropped       int32 // whether the first connection was already wrapped
 	stallAfter    int64 // if >0, stop reading (but stay connected) after this many bytes
 	refuseFirst   int32 // if >0, close this many first accepted connections immediately
+	maxConns      int32 // if >0, close every connection accepted beyond this many
+	hangAfter     int32 // if >0, accept but never serve connections beyond this many
 	accepted      int32 // total connections accepted, for asserting attempt counts
 
 	keepalives *int64 // if set, counts "keepalive@openssh.com" global requests received
@@ -63,6 +68,29 @@ func (s *testServer) closeLiveConns() {
 // serverOption tweaks a testServer before it starts serving.
 type serverOption func(*testServer)
 
+// withKeyboardInteractiveOnly models the common sshd configuration with
+// PasswordAuthentication disabled and KbdInteractiveAuthentication enabled.
+// The server accepts exactly one hidden password prompt.
+func withKeyboardInteractiveOnly() serverOption {
+	return func(s *testServer) {
+		s.sshConfig.PasswordCallback = nil
+		s.sshConfig.PublicKeyCallback = nil
+		s.sshConfig.KeyboardInteractiveCallback = func(conn ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			if conn.User() != testUser {
+				return nil, errors.New("access denied")
+			}
+			answers, err := challenge("easySFTP test", "Password authentication", []string{"Password: "}, []bool{false})
+			if err != nil {
+				return nil, err
+			}
+			if len(answers) != 1 || answers[0] != testPassword {
+				return nil, errors.New("access denied")
+			}
+			return nil, nil
+		}
+	}
+}
+
 // faultyOpen rejects reads of one exact path while delegating every other
 // request to the in-memory handler.
 type faultyOpen struct {
@@ -80,6 +108,88 @@ func (f *faultyOpen) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 func withFailOpen(path string) serverOption {
 	return func(s *testServer) {
 		s.handlers.FileGet = &faultyOpen{inner: s.handlers.FileGet, path: path}
+	}
+}
+
+// faultyList rejects directory listings ("List" requests) of one exact path
+// while delegating everything else, Stat included, to the in-memory handler.
+type faultyList struct {
+	inner sftp.FileLister
+	path  string
+}
+
+func (f *faultyList) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	if r.Method == "List" && r.Filepath == f.path {
+		return nil, errors.New("injected list failure")
+	}
+	return f.inner.Filelist(r)
+}
+
+func withFailList(path string) serverOption {
+	return func(s *testServer) {
+		s.handlers.FileList = &faultyList{inner: s.handlers.FileList, path: path}
+	}
+}
+
+// statusOnPut answers every write-open of a path starting with prefix (the
+// upload's temp file is prefix + tmpSuffix + index, so the prefix is the
+// target path) with one fixed SFTP status code, delegating everything else to
+// the in-memory handler.
+//
+// pkg/sftp's statusFromError puts an sftp.ErrSSHFx* value on the wire as that
+// exact status code, which is how a test simulates a server answering an
+// upload with a considered protocol-level refusal rather than dropping the
+// connection. The client turns it back into a *sftp.StatusError, which is what
+// isPermanentStatus classifies.
+type statusOnPut struct {
+	inner  sftp.FileWriter
+	prefix string
+	code   error // an sftp.ErrSSHFx* code
+}
+
+func (w *statusOnPut) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	if strings.HasPrefix(r.Filepath, w.prefix) {
+		return nil, w.code
+	}
+	return w.inner.Filewrite(r)
+}
+
+func withStatusOnPut(prefix string, code error) serverOption {
+	return func(s *testServer) {
+		s.handlers.FilePut = &statusOnPut{inner: s.handlers.FilePut, prefix: prefix, code: code}
+	}
+}
+
+// listRecorder records the path of every directory listing ("List") request
+// while delegating everything else to the in-memory handler, so a test can
+// assert which directories a run actually read (the stale-temp sweep's scope
+// guarantee needs exactly that).
+type listRecorder struct {
+	mu    sync.Mutex
+	inner sftp.FileLister
+	dirs  []string
+}
+
+func (l *listRecorder) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	if r.Method == "List" {
+		l.mu.Lock()
+		l.dirs = append(l.dirs, r.Filepath)
+		l.mu.Unlock()
+	}
+	return l.inner.Filelist(r)
+}
+
+// listed returns a copy of the directory paths listed so far.
+func (l *listRecorder) listed() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.dirs...)
+}
+
+func withListRecorder(rec *listRecorder) serverOption {
+	return func(s *testServer) {
+		rec.inner = s.handlers.FileList
+		s.handlers.FileList = rec
 	}
 }
 
@@ -114,6 +224,21 @@ func withFailSetstat() serverOption { return func(s *testServer) { s.failSetstat
 // handshake, simulating a transient outage (restarting sshd, network blip)
 // that clears after a moment.
 func withRefuseFirstConns(n int32) serverOption { return func(s *testServer) { s.refuseFirst = n } }
+
+// withMaxConns closes every connection accepted beyond the first n,
+// simulating a server that caps concurrent connections (sshd's MaxStartups,
+// or a per-account limit on shared hosting).
+func withMaxConns(n int32) serverOption { return func(s *testServer) { s.maxConns = n } }
+
+// withHangHandshakeAfter accepts connections beyond the first n but never
+// serves them, so the client hangs in the SSH handshake instead of failing.
+// That is what an overloaded or half-dead server looks like, and it is the one
+// shape a request-level fault (withStallOnRequest) cannot produce: the stall
+// happens before there is a session to send a request on. Close the sockets
+// with closeLiveConns to let the test finish.
+func withHangHandshakeAfter(n int32) serverOption {
+	return func(s *testServer) { s.hangAfter = n }
+}
 
 // withKeepaliveCounter makes the server tally every "keepalive@openssh.com"
 // global request it receives into c, instead of just discarding it.
@@ -295,7 +420,6 @@ func startTestServer(t *testing.T, opts ...serverOption) *testServer {
 			return nil, errors.New("access denied")
 		},
 	}
-	sshConfig.AddHostKey(hostSigner)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -310,11 +434,13 @@ func startTestServer(t *testing.T, opts ...serverOption) *testServer {
 		ClientKeyPEM:  string(pem.EncodeToMemory(clientPEM)),
 		handlers:      sftp.InMemHandler(),
 		sshConfig:     sshConfig,
+		hostSigner:    hostSigner,
 		listener:      listener,
 	}
 	for _, opt := range opts {
 		opt(srv)
 	}
+	sshConfig.AddHostKey(srv.hostSigner)
 	if srv.failRename {
 		srv.handlers.FileCmd = &faultyRename{inner: srv.handlers.FileCmd}
 	}
@@ -344,6 +470,146 @@ func (f *faultyRename) PosixRename(r *sftp.Request) error {
 	return errors.New("injected rename failure")
 }
 
+// faultyPublishRename fails the rename that publishes an upload over target,
+// while letting the rename that puts a backup back succeed. That is what makes
+// the non-atomic publish path testable: it parks the live file under
+// "<final>.easysftp-tmp.bak", renames the upload onto the final name, and
+// rolls the backup back if that fails, so a test has to fail the middle step
+// only (issue #242).
+//
+// Every attempt is failed rather than just the first, so a retry cannot
+// quietly turn the test green.
+type faultyPublishRename struct {
+	inner  sftp.FileCmder
+	target string
+}
+
+// withFailPublishRename makes every plain rename onto target fail, except one
+// coming from the backup name. Give it after withFailPosixRename so the server
+// reaches the fallback in the first place.
+func withFailPublishRename(target string) serverOption {
+	return func(s *testServer) {
+		s.handlers.FileCmd = &faultyPublishRename{inner: s.handlers.FileCmd, target: target}
+	}
+}
+
+func (f *faultyPublishRename) Filecmd(r *sftp.Request) error {
+	if r.Method == "Rename" && r.Target == f.target && !strings.HasSuffix(r.Filepath, bakSuffix) {
+		return errors.New("injected publish rename failure")
+	}
+	return f.inner.Filecmd(r)
+}
+
+func (f *faultyPublishRename) PosixRename(r *sftp.Request) error {
+	return posixRenamePassthrough(f.inner, r)
+}
+
+// faultyPosixRename wraps a FileCmder and answers every posix-rename request
+// with one fixed error while leaving plain "Rename" working, simulating a
+// server that does not implement posix-rename@openssh.com. The request server
+// maps a returned sftp.ErrSSHFx* value onto exactly that status code, so a
+// test can pick which answer a non-OpenSSH server gives (issue #152).
+type faultyPosixRename struct {
+	inner sftp.FileCmder
+	code  error
+}
+
+func withFailPosixRename(code error) serverOption {
+	return func(s *testServer) {
+		s.handlers.FileCmd = &faultyPosixRename{inner: s.handlers.FileCmd, code: code}
+	}
+}
+
+func (f *faultyPosixRename) Filecmd(r *sftp.Request) error {
+	return f.inner.Filecmd(r)
+}
+
+func (f *faultyPosixRename) PosixRename(r *sftp.Request) error {
+	return f.code
+}
+
+// unadvertisePosixRename drops posix-rename@openssh.com from the extension
+// list servers announce in their SSH_FXP_VERSION packet, which is how a client
+// learns the extension is missing. pkg/sftp keeps that list in a package-level
+// variable, so this is process-global: only call it from a test that does not
+// run in parallel (no test in this package does), and note that the extension
+// is still *served* either way, so a test also needs withFailPosixRename to
+// simulate a server that really lacks it.
+func unadvertisePosixRename(t *testing.T) {
+	t.Helper()
+	if err := sftp.SetSFTPExtensions("hardlink@openssh.com", "statvfs@openssh.com"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sftp.SetSFTPExtensions("hardlink@openssh.com", "posix-rename@openssh.com", "statvfs@openssh.com"); err != nil {
+			t.Errorf("restoring the advertised SFTP extensions: %v", err)
+		}
+	})
+}
+
+// coarseStatus answers every "not there" with one fixed generic status code
+// instead of SSH_FX_NO_SUCH_FILE, simulating a server that does not map its
+// errors onto the specific version-3 status codes the way OpenSSH does. It
+// wraps all four handler roles, so a missing path looks the same whether the
+// run listed it, stat'd it, removed it or opened it (issue #152).
+//
+// pkg/sftp's statusFromError puts an sftp.ErrSSHFx* value on the wire as that
+// exact code, and the in-memory handler reports every missing path with an
+// error satisfying os.ErrNotExist, which is what this intercepts. Everything
+// else, including a real refusal, passes through untouched.
+type coarseStatus struct {
+	cmd  sftp.FileCmder
+	list sftp.FileLister
+	get  sftp.FileReader
+	put  sftp.FileWriter
+	code error // an sftp.ErrSSHFx* code
+}
+
+func withCoarseStatus(code error) serverOption {
+	return func(s *testServer) {
+		c := &coarseStatus{
+			cmd:  s.handlers.FileCmd,
+			list: s.handlers.FileList,
+			get:  s.handlers.FileGet,
+			put:  s.handlers.FilePut,
+			code: code,
+		}
+		s.handlers.FileCmd = c
+		s.handlers.FileList = c
+		s.handlers.FileGet = c
+		s.handlers.FilePut = c
+	}
+}
+
+// coarsen replaces a "no such file" with the generic status this server gives.
+func (c *coarseStatus) coarsen(err error) error {
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		return c.code
+	}
+	return err
+}
+
+func (c *coarseStatus) Filecmd(r *sftp.Request) error { return c.coarsen(c.cmd.Filecmd(r)) }
+
+func (c *coarseStatus) PosixRename(r *sftp.Request) error {
+	return c.coarsen(posixRenamePassthrough(c.cmd, r))
+}
+
+func (c *coarseStatus) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	l, err := c.list.Filelist(r)
+	return l, c.coarsen(err)
+}
+
+func (c *coarseStatus) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	f, err := c.get.Fileread(r)
+	return f, c.coarsen(err)
+}
+
+func (c *coarseStatus) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	f, err := c.put.Filewrite(r)
+	return f, c.coarsen(err)
+}
+
 // faultySetstat wraps a FileCmder and fails every chmod (Setstat) request,
 // simulating a server that rejects SETSTAT, delegating everything else to the
 // real in-memory handler.
@@ -368,6 +634,61 @@ type faultyPathCmd struct {
 	method  string // e.g. "PosixRename", "Remove"
 	path    string // the request Target for renames, the Filepath otherwise
 	enabled atomic.Bool
+}
+
+// faultyNthCmd fails the nth matching command while enabled. The commands
+// before it still reach the in-memory filesystem, which makes partial-progress
+// accounting tests independent of goroutine completion order.
+type faultyNthCmd struct {
+	inner   sftp.FileCmder
+	method  string
+	failAt  int64
+	seen    atomic.Int64
+	enabled atomic.Bool
+}
+
+func withFaultyNthCmd(f *faultyNthCmd) serverOption {
+	return func(s *testServer) {
+		f.inner = s.handlers.FileCmd
+		s.handlers.FileCmd = f
+	}
+}
+
+func (f *faultyNthCmd) Filecmd(r *sftp.Request) error {
+	if f.enabled.Load() && r.Method == f.method && f.seen.Add(1) == f.failAt {
+		return fmt.Errorf("injected failure on %s request %d", f.method, f.failAt)
+	}
+	return f.inner.Filecmd(r)
+}
+
+func (f *faultyNthCmd) PosixRename(r *sftp.Request) error {
+	return posixRenamePassthrough(f.inner, r)
+}
+
+// slowCmd delays matching commands but lets them succeed, simulating a server
+// that makes steady progress more slowly than a whole parallel phase lasts.
+type slowCmd struct {
+	inner  sftp.FileCmder
+	method string
+	delay  time.Duration
+}
+
+func withSlowCmd(slow *slowCmd) serverOption {
+	return func(s *testServer) {
+		slow.inner = s.handlers.FileCmd
+		s.handlers.FileCmd = slow
+	}
+}
+
+func (s *slowCmd) Filecmd(r *sftp.Request) error {
+	if r.Method == s.method {
+		time.Sleep(s.delay)
+	}
+	return s.inner.Filecmd(r)
+}
+
+func (s *slowCmd) PosixRename(r *sftp.Request) error {
+	return posixRenamePassthrough(s.inner, r)
 }
 
 // withFaultyPath installs f as the FileCmd handler (wrapping the real one).
@@ -546,8 +867,22 @@ func (s *testServer) acceptLoop() {
 		if err != nil {
 			return
 		}
-		if atomic.AddInt32(&s.accepted, 1) <= s.refuseFirst {
+		n := atomic.AddInt32(&s.accepted, 1)
+		if n <= s.refuseFirst {
 			conn.Close()
+			continue
+		}
+		if s.maxConns > 0 && n-s.refuseFirst > s.maxConns {
+			conn.Close()
+			continue
+		}
+		if s.hangAfter > 0 && n > s.hangAfter {
+			// Accepted and then ignored: the client blocks in the SSH
+			// handshake with no deadline of its own. Kept in liveConns so
+			// closeLiveConns can end the test.
+			s.connMu.Lock()
+			s.liveConns = append(s.liveConns, conn)
+			s.connMu.Unlock()
 			continue
 		}
 		if s.dropAfter > 0 &&
@@ -658,3 +993,94 @@ func (l *recordingLogger) Warningf(format string, args ...any) {
 	defer l.mu.Unlock()
 	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
 }
+
+// lyingList adds one synthetic entry, once, to the listing of one exact
+// directory, so a test can play a server that answers a listing with a name
+// that points out of the directory it listed. No real server does this; the
+// point is that easySFTP must not join it into a delete path (issue #223).
+//
+// The name to inject is ".." rather than "../victim.txt", because pkg/sftp's
+// client reduces every listed name to its last component (path.Base, see
+// client.go's ReadDir) and drops the two entries a server sends literally
+// ("." and ".."). What survives that is a name whose *base* climbs, e.g.
+// "sub/..", which reaches the caller as "..". That is the whole remaining
+// escape on this path, and it is enough: joined onto the target it is the
+// target's parent, which the clean scan would then walk and empty.
+//
+// Injecting only once keeps an unfixed run terminating: the parent's listing
+// contains the target again, so a permanent injection would loop forever
+// instead of failing.
+type lyingList struct {
+	inner sftp.FileLister
+	dir   string
+	name  string
+	isDir bool
+	once  sync.Once
+}
+
+func (l *lyingList) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	lister, err := l.inner.Filelist(r)
+	if err != nil || r.Method != "List" || r.Filepath != l.dir {
+		return lister, err
+	}
+	injected := false
+	l.once.Do(func() { injected = true })
+	if !injected {
+		return lister, nil
+	}
+	return sliceLister(append(drainLister(lister), fakeFileInfo{name: l.name, dir: l.isDir})), nil
+}
+
+func withLyingList(dir, name string, isDir bool) serverOption {
+	return func(s *testServer) {
+		s.handlers.FileList = &lyingList{inner: s.handlers.FileList, dir: dir, name: name, isDir: isDir}
+	}
+}
+
+// drainLister reads a ListerAt fully into a slice.
+func drainLister(l sftp.ListerAt) []os.FileInfo {
+	var all []os.FileInfo
+	buf := make([]os.FileInfo, 16)
+	for off := int64(0); ; {
+		n, err := l.ListAt(buf, off)
+		all = append(all, buf[:n]...)
+		off += int64(n)
+		if err != nil {
+			return all
+		}
+	}
+}
+
+// sliceLister serves a fixed slice of entries as a sftp.ListerAt.
+type sliceLister []os.FileInfo
+
+func (l sliceLister) ListAt(f []os.FileInfo, off int64) (int, error) {
+	if off >= int64(len(l)) {
+		return 0, io.EOF
+	}
+	n := copy(f, l[off:])
+	if off+int64(n) >= int64(len(l)) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// fakeFileInfo is a minimal os.FileInfo for an entry the server invents. Its
+// ModTime is the epoch, so the stale-temp sweep considers it old enough to
+// remove and the name is the only thing standing between it and a Remove.
+type fakeFileInfo struct {
+	name string
+	dir  bool
+}
+
+func (f fakeFileInfo) Name() string { return f.name }
+func (f fakeFileInfo) Size() int64  { return 0 }
+func (f fakeFileInfo) Mode() os.FileMode {
+	if f.dir {
+		return os.ModeDir | 0o755
+	}
+	return 0o644
+}
+func (f fakeFileInfo) ModTime() time.Time { return time.Unix(0, 0) }
+func (f fakeFileInfo) IsDir() bool        { return f.dir }
+func (f fakeFileInfo) Sys() any           { return nil }
