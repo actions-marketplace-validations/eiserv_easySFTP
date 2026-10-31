@@ -1,7 +1,9 @@
 package uploader
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/pem"
 	"errors"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/text/unicode/norm"
 )
 
 // testServer is an in-process SSH server exposing an in-memory SFTP root,
@@ -28,10 +31,14 @@ type testServer struct {
 	Port          int
 	HostKeySHA256 string
 	HostPubKey    ssh.PublicKey
+	// ExtraHostKeys, filled by withExtraECDSAHostKey, are the public halves
+	// of the additional host keys, in the order they were added.
+	ExtraHostKeys []ssh.PublicKey
 	ClientKeyPEM  string
 	handlers      sftp.Handlers
 	sshConfig     *ssh.ServerConfig
 	hostSigner    ssh.Signer
+	extraSigners  []ssh.Signer // additional host keys of other types, like a stock OpenSSH server
 	listener      net.Listener
 
 	// Fault injection (set via options before the accept loop starts).
@@ -44,6 +51,9 @@ type testServer struct {
 	refuseFirst   int32 // if >0, close this many first accepted connections immediately
 	maxConns      int32 // if >0, close every connection accepted beyond this many
 	hangAfter     int32 // if >0, accept but never serve connections beyond this many
+	hangFrom      int32 // if >0, also never serve connections from this one on, the first included
+	maxLive       int32 // if >0, close connections accepted while this many are live
+	liveCount     int32 // live connections, for withMaxLiveConns
 	accepted      int32 // total connections accepted, for asserting attempt counts
 
 	keepalives *int64 // if set, counts "keepalive@openssh.com" global requests received
@@ -88,6 +98,25 @@ func withKeyboardInteractiveOnly() serverOption {
 			}
 			return nil, nil
 		}
+	}
+}
+
+// withExtraECDSAHostKey adds an ECDSA P-256 host key next to the server's
+// default Ed25519 one, modelling a stock OpenSSH server that has one key of
+// each type. Go's default client preference picks ECDSA before Ed25519, so a
+// client that pinned the Ed25519 key alone sees a mismatch against such a
+// server (issue #282).
+func withExtraECDSAHostKey() serverOption {
+	return func(s *testServer) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			panic(err)
+		}
+		signer, err := ssh.NewSignerFromKey(key)
+		if err != nil {
+			panic(err)
+		}
+		s.extraSigners = append(s.extraSigners, signer)
 	}
 }
 
@@ -230,6 +259,28 @@ func withRefuseFirstConns(n int32) serverOption { return func(s *testServer) { s
 // or a per-account limit on shared hosting).
 func withMaxConns(n int32) serverOption { return func(s *testServer) { s.maxConns = n } }
 
+// liveConn decrements the server's live-connection count when it is closed,
+// so withMaxLiveConns sees connections leave as well as arrive; the once is
+// because a connection can be closed more than once (closeLiveConns and the
+// SSH handshake's own teardown both reach the socket).
+type liveConn struct {
+	net.Conn
+	once sync.Once
+	live *int32
+}
+
+func (c *liveConn) Close() error {
+	c.once.Do(func() { atomic.AddInt32(c.live, -1) })
+	return c.Conn.Close()
+}
+
+// withMaxLiveConns closes every connection accepted while n connections are
+// already live, simulating a server whose limit is concurrent (sshd's
+// MaxSessions, or a per-account limit on shared hosting): once one run's
+// connections are closed the next run's are welcome again, which is the
+// difference between this and withMaxConns' lifetime budget.
+func withMaxLiveConns(n int32) serverOption { return func(s *testServer) { s.maxLive = n } }
+
 // withHangHandshakeAfter accepts connections beyond the first n but never
 // serves them, so the client hangs in the SSH handshake instead of failing.
 // That is what an overloaded or half-dead server looks like, and it is the one
@@ -238,6 +289,15 @@ func withMaxConns(n int32) serverOption { return func(s *testServer) { s.maxConn
 // with closeLiveConns to let the test finish.
 func withHangHandshakeAfter(n int32) serverOption {
 	return func(s *testServer) { s.hangAfter = n }
+}
+
+// withHangHandshakeFrom never serves connections from the n-th on either, the
+// first included when n is 1: the run meets a server that was already dead
+// before it started, not one that dies after serving the first connection.
+// That is the shape the initial connect and the jump-host tunnel see
+// (issue #277); withHangHandshakeAfter covers pooled dials and redials.
+func withHangHandshakeFrom(n int32) serverOption {
+	return func(s *testServer) { s.hangFrom = n }
 }
 
 // withKeepaliveCounter makes the server tally every "keepalive@openssh.com"
@@ -440,7 +500,13 @@ func startTestServer(t *testing.T, opts ...serverOption) *testServer {
 	for _, opt := range opts {
 		opt(srv)
 	}
+	for _, signer := range srv.extraSigners {
+		srv.ExtraHostKeys = append(srv.ExtraHostKeys, signer.PublicKey())
+	}
 	sshConfig.AddHostKey(srv.hostSigner)
+	for _, signer := range srv.extraSigners {
+		sshConfig.AddHostKey(signer)
+	}
 	if srv.failRename {
 		srv.handlers.FileCmd = &faultyRename{inner: srv.handlers.FileCmd}
 	}
@@ -453,6 +519,80 @@ func startTestServer(t *testing.T, opts ...serverOption) *testServer {
 
 	go srv.acceptLoop()
 	return srv
+}
+
+// foldServerPath case-folds and Unicode-normalizes every path segment, which
+// is the comparison rule of a case-insensitive filesystem: two spellings that
+// differ only by case (or by NFC/NFD form) are one entry. Used by
+// withCaseInsensitive to model NTFS, default APFS, and the many NAS appliances
+// whose names fold the same way.
+func foldServerPath(p string) string {
+	folded := make([]string, 0, strings.Count(p, "/")+1)
+	for _, seg := range strings.Split(p, "/") {
+		folded = append(folded, strings.ToLower(norm.NFKC.String(seg)))
+	}
+	return strings.Join(folded, "/")
+}
+
+// caseInsensitiveHandlers wraps an in-memory SFTP backend so every path it
+// stores or looks up is case-folded first, which is the whole emulation of a
+// filesystem whose directory entries are case-insensitive: two spellings that
+// differ only by case (or by NFC/NFD form) resolve to one entry, whichever
+// spelling created it. The request server builds one Request per packet, so
+// folding the request fields in place before delegating is sufficient.
+//
+// Like every other FileCmder wrapper in this file, it needs the PosixRename
+// method: without it pkg/sftp silently downgrades posix-rename to plain
+// "Rename", which fails whenever the target exists, and every overwriting
+// rename (each manifest rewrite) would die with "file already exists".
+type caseInsensitiveHandlers struct {
+	inner sftp.Handlers
+}
+
+func (h caseInsensitiveHandlers) fold(req *sftp.Request) *sftp.Request {
+	req.Filepath = foldServerPath(req.Filepath)
+	if req.Target != "" {
+		req.Target = foldServerPath(req.Target)
+	}
+	return req
+}
+
+func (h caseInsensitiveHandlers) Fileread(req *sftp.Request) (io.ReaderAt, error) {
+	return h.inner.FileGet.Fileread(h.fold(req))
+}
+
+func (h caseInsensitiveHandlers) Filewrite(req *sftp.Request) (io.WriterAt, error) {
+	return h.inner.FilePut.Filewrite(h.fold(req))
+}
+
+func (h caseInsensitiveHandlers) Filecmd(req *sftp.Request) error {
+	return h.inner.FileCmd.Filecmd(h.fold(req))
+}
+
+func (h caseInsensitiveHandlers) PosixRename(req *sftp.Request) error {
+	return posixRenamePassthrough(h.inner.FileCmd, h.fold(req))
+}
+
+func (h caseInsensitiveHandlers) Filelist(req *sftp.Request) (sftp.ListerAt, error) {
+	return h.inner.FileList.Filelist(h.fold(req))
+}
+
+// withCaseInsensitive models a server whose filesystem treats names that
+// differ only by case (or Unicode normalization form) as the same file:
+// Windows OpenSSH on NTFS, macOS servers on default APFS, and many NAS
+// appliances. Every path the in-memory backend stores or resolves is
+// case-folded first, so an upload of README.md lands on the entry an old
+// Readme.md created, and a Remove of either spelling removes it.
+func withCaseInsensitive() serverOption {
+	return func(s *testServer) {
+		folding := caseInsensitiveHandlers{inner: s.handlers}
+		s.handlers = sftp.Handlers{
+			FileGet:  folding,
+			FilePut:  folding,
+			FileCmd:  folding,
+			FileList: folding,
+		}
+	}
 }
 
 // faultyRename wraps a FileCmder and fails every rename, delegating everything
@@ -814,6 +954,33 @@ func (f *stallOnRequest) PosixRename(r *sftp.Request) error {
 	return posixRenamePassthrough(f.inner, r)
 }
 
+// stallOnStat blocks the first Stat of one exact path without responding,
+// simulating a server that completes the SSH handshake and the SFTP session
+// and then hangs the moment a request lands on it. The skip_unchanged
+// decision waits on exactly that stat (issue #277), which is the window the
+// fix moves inside the stall watchdog's active one. The block releases after
+// a generous safety timeout so an abandoned handler goroutine cannot outlive
+// the test binary for long (same pattern as stallOnRequest).
+type stallOnStat struct {
+	inner sftp.FileLister
+	path  string
+	fired atomic.Bool
+}
+
+func withStallOnStat(path string) serverOption {
+	return func(s *testServer) {
+		s.handlers.FileList = &stallOnStat{inner: s.handlers.FileList, path: path}
+	}
+}
+
+func (f *stallOnStat) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	if r.Method == "Stat" && r.Filepath == f.path && !f.fired.Swap(true) {
+		time.Sleep(30 * time.Second)
+		return nil, errors.New("stalled stat finally failed")
+	}
+	return f.inner.Filelist(r)
+}
+
 // dropConn closes the connection once it has read limit bytes, simulating a
 // network drop partway through a transfer.
 type dropConn struct {
@@ -876,7 +1043,15 @@ func (s *testServer) acceptLoop() {
 			conn.Close()
 			continue
 		}
-		if s.hangAfter > 0 && n > s.hangAfter {
+		if s.maxLive > 0 {
+			if atomic.LoadInt32(&s.liveCount) >= s.maxLive {
+				conn.Close()
+				continue
+			}
+			conn = &liveConn{Conn: conn, live: &s.liveCount}
+			atomic.AddInt32(&s.liveCount, 1)
+		}
+		if (s.hangAfter > 0 && n > s.hangAfter) || (s.hangFrom > 0 && n >= s.hangFrom) {
 			// Accepted and then ignored: the client blocks in the SSH
 			// handshake with no deadline of its own. Kept in liveConns so
 			// closeLiveConns can end the test.
@@ -902,6 +1077,9 @@ func (s *testServer) acceptLoop() {
 func (s *testServer) handleConn(conn net.Conn) {
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
 	if err != nil {
+		// A handshake that never completed still holds a live-connection
+		// slot in withMaxLiveConns' count; give it back.
+		conn.Close()
 		return
 	}
 	defer sshConn.Close()

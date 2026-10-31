@@ -76,6 +76,17 @@ Notes:
 - The first sync into a directory uploads everything and creates the manifest.
 - A missing or corrupt manifest degrades safely to "upload everything, delete
   nothing" (with a warning).
+- **Two sync deployments must not share one target.** The manifest file is
+  named by the run-wide `sync.manifest` setting and lives in the target, so
+  two sync deployments into the same directory read and write one manifest
+  and delete each other's files, in a run that finishes green. The
+  configuration is refused before anything is uploaded. To deploy several
+  sources into one place, merge them into one directory in the build step
+  and sync that, or give each deployment its own subdirectory of the target
+  (both stay plain `sync` deployments). A sync target overlapped by another
+  deployment's `clean` target is *not* refused: `clean` is documented to
+  wipe everything under its target. The run still warns about it, because
+  what the sync keeps is then decided by run order.
 - The manifest trusts itself: a file changed *on the server* out of band is not
   re-detected until its local content changes. Run `clean` once to reset.
 - Directories left empty by deletions are pruned automatically.
@@ -90,6 +101,14 @@ Notes:
   rewrite, no per-directory round-trips. Exception: with `permissions.directories`
   set, every directory of the plan is still chmod'd, per its documented
   "creates or touches" semantics.
+- Case-insensitive targets (Windows OpenSSH on NTFS, macOS servers on default
+  APFS, many NAS appliances) are safe for case-only renames: a file whose name
+  changed only by case (`Readme.md` to `README.md`, also NFC/NFD differences
+  between macOS and Linux checkouts) has its old spelling removed *before* the
+  new one is uploaded, never after. A delete after the upload would remove the
+  file the run just wrote, because both spellings are one directory entry
+  there; the delete-first order is what lets the new spelling take effect at
+  all.
 
 > **⚠️ The manifest is publicly downloadable in web-root deployments.** The
 > manifest lives *inside* the deploy target, so when that target is a public
@@ -116,10 +135,13 @@ This is the same trade rsync's "quick check" makes.
 **The trade-off, precisely:** a file whose content changed *without* its size
 or modification time changing is invisible to this check and will be missed.
 Modification times are compared at nanosecond resolution, so on common
-filesystems (ext4, APFS, NTFS) that takes two same-size edits with
-bit-identical timestamps; on filesystems with coarse timestamps (FAT stores
-2-second mtimes, and some network filesystems round to seconds), the window
-stays as wide as the filesystem's own clock.
+filesystems (ext4, APFS, NTFS) this requires bit-identical timestamps. Build
+systems can deliberately normalize timestamps, though: in a tree with fixed
+modification times (for example, Nix store output), a same-size content change
+can keep the recorded timestamp on every build and repeatedly reuse a stale
+hash. Leave `sync.fast_path: false` for such trees. On filesystems with coarse
+timestamps (FAT stores 2-second mtimes, and some network filesystems round to
+seconds), the window stays as wide as the filesystem's own clock.
 Without `fast_path`, `sync` never misses a content change, because it
 always compares actual content hashes; this is what you give up in exchange
 for skipping local reads.
@@ -161,9 +183,12 @@ Two safety nets apply before `sync` or `clean` delete anything:
   or the empty string is rejected outright. So is one that climbs above the
   directory the session starts in, such as `..`, `../..` or `dist/../..`,
   which is where a target built from a workflow expression tends to land when
-  the expression is empty or has a component too many. No mode will ever wipe
-  a server root or a login directory. A relative target that stays put, like
-  `www/public_html`, is unaffected.
+  the expression is empty or has a component too many. The root of a Windows
+  drive is refused the same way, whatever its spelling: a Windows SFTP server
+  addresses a drive as `/C:/...` or `C:/...`, and a target that resolves to
+  the drive itself (`C:`, `C:/`, `/C:/`, `/C:/site/..`) is a root, not a
+  deploy target. No mode will ever wipe a server root or a login directory.
+  A relative target that stays put, like `www/public_html`, is unaffected.
 - **`max_deletes`** aborts a run that would remove more remote entries than
   the limit, catching a misconfiguration before it does damage. `0` means
   unlimited, and is the default. Set it via `safety.max_deletes` in the

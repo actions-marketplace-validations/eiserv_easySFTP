@@ -17,8 +17,6 @@ import (
 	"strings"
 	"time"
 
-	ignore "github.com/sabhiram/go-gitignore"
-
 	"github.com/eiserv/easySFTP/internal/autocache"
 	"github.com/eiserv/easySFTP/internal/config"
 	"github.com/eiserv/easySFTP/internal/metrics"
@@ -58,6 +56,10 @@ type DeploymentStats struct {
 	Strategy      config.Strategy
 	FilesUploaded int
 	FilesDeleted  int
+	// DirsDeleted counts remote directories removed by the clean mode's sweep
+	// and the sync mode's prune, mirroring the run totals' own field so the
+	// per-deployment rows add up to what the run reports (issue #287).
+	DirsDeleted   int
 	FilesSkipped  int
 	BytesUploaded int64
 	Duration      time.Duration
@@ -70,6 +72,9 @@ func Run(ctx context.Context, cfg *config.Config, log Logger) (*Stats, error) {
 	defer func() { stats.Duration = time.Since(start) }()
 	if len(cfg.Algorithms.Insecure) > 0 {
 		log.Warningf("connection.algorithms explicitly enables insecure SSH algorithm(s): %s; use these only when a server cannot negotiate modern algorithms", strings.Join(cfg.Algorithms.Insecure, ", "))
+	}
+	for _, warning := range cfg.SyncTargetWarnings() {
+		log.Warningf("%s", warning)
 	}
 
 	// One budget for the whole run: safety.max_deletes lives under a run-wide
@@ -97,7 +102,11 @@ func Run(ctx context.Context, cfg *config.Config, log Logger) (*Stats, error) {
 	for _, pair := range cfg.Uploads {
 		st := effectiveStrategy(pair)
 		lines := append(append([]string{}, cfg.IgnoreLines...), pair.Ignore...)
-		matcher := ignore.CompileIgnoreLines(lines...)
+		matcher, err := compileGitignore(lines)
+		if err != nil {
+			endScan()
+			return stats, err
+		}
 		// verbose is nil unless log-level is debug; buildPlan then explains
 		// every exclude decision.
 		var verbose Logger
@@ -186,6 +195,7 @@ func Run(ctx context.Context, cfg *config.Config, log Logger) (*Stats, error) {
 			Strategy:      p.strategy,
 			FilesUploaded: stats.FilesUploaded - before.FilesUploaded,
 			FilesDeleted:  stats.FilesDeleted - before.FilesDeleted,
+			DirsDeleted:   stats.DirsDeleted - before.DirsDeleted,
 			FilesSkipped:  stats.FilesSkipped - before.FilesSkipped,
 			BytesUploaded: stats.BytesUploaded - before.BytesUploaded,
 			Duration:      time.Since(planStart),
@@ -211,6 +221,15 @@ func logDeploymentSummary(cfg *config.Config, pair config.UploadPair, ds Deploym
 	if cfg.DryRun {
 		log.Infof("deployment %s: %d file(s) to upload (%s), %d to delete, %d unchanged (dry-run)",
 			pair.Label(), ds.FilesUploaded, HumanSize(ds.BytesUploaded), ds.FilesDeleted, ds.FilesSkipped)
+		return
+	}
+	// The deleted count is files only, like the run summary; removed
+	// directories are named when there were any, so a clean deployment that
+	// only removed directories no longer reads as "deleted 0" (issue #287).
+	if ds.DirsDeleted > 0 {
+		log.Infof("deployment %s: uploaded %d file(s) (%s), deleted %d, removed %d director(y/ies), skipped %d unchanged, took %s",
+			pair.Label(), ds.FilesUploaded, HumanSize(ds.BytesUploaded), ds.FilesDeleted, ds.DirsDeleted, ds.FilesSkipped,
+			ds.Duration.Round(time.Millisecond))
 		return
 	}
 	log.Infof("deployment %s: uploaded %d file(s) (%s), deleted %d, skipped %d unchanged, took %s",
@@ -246,6 +265,18 @@ func executeOverlayOrClean(ctx context.Context, cfg *config.Config, sess *sessio
 	if p.strategy == config.StrategyClean {
 		if err := checkRemoteRoot(p.pair.Remote); err != nil {
 			return err
+		}
+		// An empty plan under clean means the sweep is about to remove the
+		// whole target and upload nothing. That is usually not what anyone
+		// meant: a build step that produced an empty dist/ (misconfigured
+		// output path, a framework that moved it, an exclude that matches
+		// everything) reads as a green run while it wipes production. The
+		// (0 local files) in the group header is too quiet, so say it as a
+		// warning with the count before anything is deleted (issue #317,
+		// the line #279 item 3 proposed).
+		if len(p.files) == 0 {
+			log.Warningf("deployment %s planned 0 files from %s; mode: clean will remove remote entries under %s and upload nothing",
+				p.pair.Label(), p.pair.Local, base)
 		}
 		endRemoteScan := metrics.Phase("remote_scan")
 		files, dirs, err := listRemoteContents(ctx, sess, base, watch, log)

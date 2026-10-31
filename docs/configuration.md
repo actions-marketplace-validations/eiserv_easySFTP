@@ -127,7 +127,7 @@ connection:
   host: sftp.example.com
   port: 22                     # optional
   username: deploy
-  host_key: |
+  host_key: |                      # a list of fingerprints works too:
     SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8
   # known_hosts: |             # alternative to host_key
   #   sftp.example.com ssh-ed25519 AAAA...
@@ -190,7 +190,7 @@ sync:
 | `version` | ✅ | Must be `3`. |
 | `connection` | ✅ | Where and as whom to connect. Credentials are **not** here; they stay inputs. |
 | `defaults` | | `mode` and `exclude` defaults applied to every deployment. |
-| `deployments` | ✅ | A **map** of named deployments (at least one). The name appears in logs and the job summary. |
+| `deployments` | ✅ | A **map** of named deployments (at least one). The name appears in logs and the job summary. Two `mode: sync` deployments must not share one target: they would read and write the same sync manifest and delete each other's files, so that configuration is refused; see [strategies](strategies.md#sync). |
 | `safety` | | `max_deletes`: the most remote entries, **files and directories together**, the **whole run** may remove (0 = unlimited, the default); see [delete guards](strategies.md#delete-guards). |
 | `advanced` | | Transfer tuning; the defaults suit most deploys. |
 | `permissions` | | Remote file/dir modes and `preserve_times` (all best-effort). |
@@ -203,7 +203,7 @@ sync:
 | `host` | ✅ | - | Hostname or IP of the SFTP server. |
 | `port` | | `22` | SSH port. |
 | `username` | ✅ | - | Username for authentication. |
-| `host_key` | ³ | - | SHA256 fingerprint(s), one per line. |
+| `host_key` | ³ | - | SHA256 fingerprint(s): one per line, or as a YAML list. |
 | `known_hosts` | ³ | - | `known_hosts`-format host key(s); alternative to `host_key`. |
 | `allow_any_host_key` | ³ | `false` | Explicit opt-out of host key verification. |
 | `algorithms` | | - | Add legacy `key_exchanges`, `ciphers`, `macs`, or `host_key_algorithms` to the SSH negotiation policy for both the target and proxy hop. Unknown names fail; insecure additions warn and appear in the job summary. |
@@ -215,7 +215,7 @@ current `golang.org/x/crypto/ssh` version classifies as supported and adds the
 named values. Categories you omit keep the library defaults exactly. Prefer
 upgrading the server, and enable only the one algorithm the server needs.
 
-³ As in inline mode, exactly one of `host_key`/`known_hosts`/`allow_any_host_key` is required, per hop.
+³ As in inline mode, at least one of `host_key`/`known_hosts` is required per hop, or you must explicitly opt out with `allow_any_host_key: true`; setting both `host_key` and `known_hosts` is allowed, and a key matching either is accepted.
 
 #### `deployments.<name>`
 
@@ -231,8 +231,8 @@ upgrading the server, and enable only the one algorithm the server needs.
 | Field | Default | Description |
 |---|---|---|
 | `retries` | `2` | Retries per file on transient errors, and the reconnect budget for dropped connections. Failures the server reports with a permanent status code are never retried; see [which upload failures are retried](troubleshooting.md#which-upload-failures-easysftp-retries). `0` disables. |
-| `timeout` | `30` | Connection timeout in seconds. `0` disables. |
-| `stall_timeout` | `0` (off) | Abort when active remote operations make no progress for this many seconds. |
+| `timeout` | `30` | Connection timeout in seconds, covering the whole initial connection: the TCP dial, the SSH handshake of every hop (including through a jump host) and the SFTP session setup. A server that accepts and then stalls fails here instead of hanging the run. `0` disables. Capped at `86400` (a day). |
+| `stall_timeout` | `0` (off) | Abort when active remote operations make no progress for this many seconds. Capped at `86400` (a day). |
 | `concurrency` | `auto` | Files uploaded in parallel, and independent remote metadata requests such as directory setup, stale-temp cleanup, scans and deletes. `auto` sizes it to the work (see [transfer tuning](tuning.md)). Sync hashing uses the runner's available Go CPU parallelism independently. |
 | `request_concurrency` | `auto` | Max in-flight SFTP requests per file (pipelining within one transfer). `auto` sizes it to the largest file and to what the whole set costs to hold in flight (see [transfer tuning](tuning.md)). |
 | `connections` | `auto` | SSH connections the parallel uploads spread over. Never more than `concurrency`. `auto` opens another one only while it would save more time than its handshake costs. See below. |
@@ -368,7 +368,11 @@ destination:
   `/`, which means "into this directory" keeping the original file name.
 - Single files only support the `overlay` mode (`sync`/`clean` reconcile a
   directory tree and are rejected for single-file targets).
-- Symlinks, sockets and other non-regular files are skipped.
+- Symlinks, sockets and other non-regular files *inside* the source tree are
+  skipped. A `source` that is itself a symlink to a directory (or, on
+  Windows, a junction) is followed: the directory it points at is uploaded.
+  A junction whose target cannot be resolved fails the run rather than
+  deploying an empty plan.
 
 ```yaml
     source: ./config/prod.json
@@ -394,6 +398,18 @@ exclude: |
 
 - Patterns are matched against the path **relative to the local root** of each
   deployment.
+- The semantics are git's own, not a regex approximation: `?` is a
+  one-character wildcard, `[abc]` / `[!abc]` are character classes, `**`
+  spans directories, a slash anywhere but the end anchors the pattern at
+  the root, and `(`, `+`, `$`, `^`, `|` are literal name characters. The
+  suite pins this with a differential test that runs `git
+  check-ignore` over every table row when git is on PATH.
+- A pattern that cannot be parsed (an unterminated `[...]` class at any
+  unescaped bracket of the line, a lone trailing backslash) fails the run
+  with the offending line named instead of being silently dropped. An
+  escaped `\[` is a literal bracket, not a class, and parses.
+- An escaped trailing space (`foo` + backslash + space) is a literal
+  name; an unescaped trailing space is trimmed, a tab never is.
 - `!pattern` re-includes files excluded by an earlier pattern.
 - In the config file, per-deployment `exclude` lists add to `defaults.exclude`.
 - An ignored directory (e.g. `node_modules/`) is skipped without being walked
@@ -401,6 +417,21 @@ exclude: |
   automatically disabled as soon as any pattern is a `!` re-include, because a
   re-include may point below an ignored directory; results are identical either
   way, only planning speed differs.
+- One difference from git is deliberate: a `!` re-include below an ignored
+  directory is honored when it is later than every excluded ancestor
+  (`dist/` then `!dist/keep.txt` uploads `keep.txt`), where git stops at the
+  excluded directory and never reaches the file. The pruning above is what
+  makes that both possible and exact: with pruning off, every file is walked
+  and the last matching pattern wins. An earlier re-include does not shield
+  a path from a directory exclude that comes after it (`!important.txt` then
+  `secrets/` still excludes `secrets/important.txt`; `a/b/` then
+  `!a/b/x.txt` then `a/` still excludes `a/b/x.txt`, because `a/` is the
+  later line even though the directory it excludes is shallower), the same
+  last-line rule git applies everywhere else.
+- Character classes negate with `!` or `^` (`[!o]`, `[^o]`), as git's
+  fnmatch does. POSIX classes inside brackets (`[[:digit:]]`) are not
+  supported and match literally; that is the one known class difference
+  from git.
 
 ## Outputs
 

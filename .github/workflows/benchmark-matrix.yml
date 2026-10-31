@@ -39,6 +39,15 @@ name: SFTP benchmark matrix
 # scenario; the job's timeout is generous for that reason, and the inputs exist
 # so a quick look can be a quick look.
 #
+# The defaults above the old cap (connections 16, concurrency 128,
+# request_concurrency 128) exist because the stored sweeps kept reporting the
+# best cell on the largest swept value (issue #240): every v3.8.3 scenario whose
+# optimum was not already payload-bound sat on an edge, so the honest fix is to
+# sweep further rather than to keep fitting against an edge. The request axis is
+# clamped to the packet count of the scenario's largest file, the same rule the
+# file count applies to the other two axes, so the wider values cost nothing on
+# a payload that cannot use them.
+#
 # Each sweep also measures the settings easySFTP picks for itself, once per
 # scenario and profile, and reports the gap to the best cell as the policy's
 # regret. That number is what the auto-config work of #156 has to beat.
@@ -65,17 +74,17 @@ on:
       connections:
         description: "advanced.connections values to sweep, space separated."
         required: false
-        default: "1 2 4 8"
+        default: "1 2 4 8 16"
         type: string
       concurrency:
         description: "advanced.concurrency values to sweep, space separated. Each scenario is swept over the values its file count can use, so a large value costs nothing on a small payload."
         required: false
-        default: "1 2 4 8 16 32 64"
+        default: "1 2 4 8 16 32 64 128"
         type: string
       request-concurrency:
         description: "Third axis (advanced.request_concurrency), space separated. Applied only to scenarios whose files are at least 1 MiB, since the setting is per file. The token 'default' is a pass that sets nothing, so 'default' alone gives a two-dimensional grid."
         required: false
-        default: "1 16 64"
+        default: "1 16 64 128"
         type: string
       scenarios:
         description: "Scenarios to sweep: small, mixed, large, single, plus the deploy shapes redeploy, sync, deep, bulk and the calibration family calib-<count>x<size> (for example calib-100x64k). redeploy and sync deploy their tree twice per cell, only the second one measured."
@@ -93,9 +102,9 @@ on:
         default: ""
         type: string
       repeats:
-        description: "Measured repeats per cell; the median is reported."
+        description: "Measured repeats per cell; three is the smallest count that can yield a non-zero MAD. Use fewer only for exploratory sweeps."
         required: false
-        default: "1"
+        default: "3"
         type: string
       store:
         description: "Commit the result to benchmarks/matrix/ on main."
@@ -114,7 +123,7 @@ on:
         type: string
   # The release sweep. Its defaults are the "all use cases" grid: every
   # scenario the harness knows, over the axes each payload can actually use,
-  # measured twice. That is hours of runner time per release, which is what the
+  # measured three times. That is hours of runner time per release, which is what the
   # timeout below is for, and it is the reason the release still gets its cheap
   # three-scenario standard number from benchmark.yml as well.
   workflow_call:
@@ -131,17 +140,17 @@ on:
       connections:
         description: "advanced.connections values to sweep, space separated."
         required: false
-        default: "1 2 4 8"
+        default: "1 2 4 8 16"
         type: string
       concurrency:
         description: "advanced.concurrency values to sweep, space separated. Each scenario is swept over the values its file count can use."
         required: false
-        default: "1 2 4 8 16 32 64"
+        default: "1 2 4 8 16 32 64 128"
         type: string
       request-concurrency:
         description: "Third axis (advanced.request_concurrency), space separated. The token 'default' is a pass that sets nothing."
         required: false
-        default: "1 16 64"
+        default: "1 16 64 128"
         type: string
       link-profiles:
         description: "Optional network axis, space separated. Empty = the real line only. Every profile multiplies the whole grid, and shaping needs tc plus NET_ADMIN on the runner."
@@ -154,9 +163,9 @@ on:
         default: ""
         type: string
       repeats:
-        description: "Measured repeats per cell; the median is reported. Two is the smallest number that still yields a MAD."
+        description: "Measured repeats per cell; three is the smallest count that can yield a non-zero MAD under the lower-middle median."
         required: false
-        default: "2"
+        default: "3"
         type: string
       store:
         description: "Commit the result to benchmarks/matrix/ on main."
@@ -193,15 +202,27 @@ jobs:
     # grid grew (the stored 2026-08-16 run measured for 11h25m). A timeout that
     # cuts a sweep in half throws away the whole run, not half of it.
     timeout-minutes: 1440
+    # What the storing job needs to file the sweep: the label and the time this
+    # run resolved, and the commit the candidate was built from. The sweep
+    # itself travels as the artifact, never as a job output.
+    outputs:
+      label: ${{ steps.resolve.outputs.label }}
+      recorded-at: ${{ steps.resolve.outputs.recorded-at }}
+      candidate-sha: ${{ steps.build.outputs.candidate-sha }}
     # Same gate as benchmark.yml: a manual sweep waits for a maintainer, the
     # automatic post-release one must not, or every release stalls on a click.
     environment: ${{ github.event_name == 'push' && 'benchmark-release' || 'benchmark' }}
     permissions:
-      contents: write
+      # Read only (issue #283), for the same reason as benchmark.yml's
+      # measuring job: the candidate swept here may be a pull request's code,
+      # and the storing job below does the writing instead.
+      contents: read
     steps:
       # The workflow's own checkout, for cmd/easysftp-bench. It runs first: a
       # root checkout cleans the workspace and would remove the build checkouts.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve what to benchmark
         id: resolve
@@ -241,6 +262,9 @@ jobs:
         with:
           ref: ${{ steps.resolve.outputs.ref }}
           path: builds/candidate
+          # Nothing below this point pushes, so the token has no business
+          # staying on the self-hosted machine's disk (issue #283).
+          persist-credentials: false
 
       - name: Check out the baseline
         if: inputs.baseline-ref != ''
@@ -248,6 +272,7 @@ jobs:
         with:
           ref: ${{ inputs.baseline-ref }}
           path: builds/baseline
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -295,7 +320,7 @@ jobs:
           CANDIDATE_REF: ${{ steps.build.outputs.candidate-ref }}
           BASELINE_BIN: ${{ steps.build.outputs.baseline-bin }}
           BASELINE_REF: ${{ steps.build.outputs.baseline-ref }}
-          REPEATS: ${{ inputs.repeats || '1' }}
+          REPEATS: ${{ inputs.repeats || '3' }}
           REMOTE_BASE: ${{ inputs.remote-base || '/easysftp-benchmark' }}
           MATRIX_CONNECTIONS: ${{ inputs.connections }}
           MATRIX_CONCURRENCY: ${{ inputs.concurrency }}
@@ -323,42 +348,81 @@ jobs:
 
       - name: Upload the results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-matrix-${{ github.run_id }}
           path: ${{ runner.temp }}/matrix-results
           if-no-files-found: ignore
 
-      - name: Check out main for storing
-        if: inputs.store
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # A sweep asked not to store (inputs.store = false) stops here, and the
+      # storing job below drops out on its "if:". The sweep itself is already
+      # on its way as the artifact uploaded above.
+
+  # The storing half of the split (issue #283), the same shape as the "store"
+  # job of benchmark.yml: everything a sweep writes to main happens here, on a
+  # GitHub-hosted runner, with a token that never touched the self-hosted
+  # machine and a harness built from main -- never from the swept ref.
+  store:
+    name: Store the sweep on main
+    needs: matrix
+    # The same gate the storing steps used before the split: "store" is the
+    # sweep's own input, and a failed measurement (which fails "needs") is no
+    # reason to file a half-written grid.
+    if: inputs.store
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # main, not the swept ref: the storing code decides what a stored
+      # document looks like, and that must not depend on which ref was
+      # measured (the same rule the harness build above already follows).
+      # This checkout runs before the artifact download below, and the order
+      # is load-bearing: a fresh runner workspace has no .git directory, so
+      # checkout's prepareExistingDirectory would remove non-repository
+      # contents -- including a results/ the download step created -- if the
+      # download ran first (review of #300).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          path: store-main
-          # Full history: the commit below rebases onto whatever landed on main
-          # while the sweep was running, which a shallow clone cannot do.
+          # Full history: the commit below rebases onto whatever landed on
+          # main while the sweep was running, which a shallow clone cannot
+          # do. This checkout pushes, so it keeps its credentials.
           fetch-depth: 0
 
-      - name: Store the result
-        if: inputs.store
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: benchmark-matrix-${{ github.run_id }}
+          path: results
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build the harness from main
         env:
-          BENCH_DIR: store-main/benchmarks
-          RESULTS_JSON: ${{ runner.temp }}/matrix-results/matrix.json
-          SUMMARY_MD: ${{ runner.temp }}/matrix-results/matrix.md
-          RESULTS_CSV: ${{ runner.temp }}/matrix-results/matrix.csv
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/bin/easysftp-bench" ./cmd/easysftp-bench
+
+      - name: Store the sweep
+        env:
+          BENCH_DIR: benchmarks
+          RESULTS_JSON: results/matrix.json
+          SUMMARY_MD: results/matrix.md
+          RESULTS_CSV: results/matrix.csv
           KIND: matrix
-          LABEL: ${{ steps.resolve.outputs.label }}
-          RECORDED_AT: ${{ steps.resolve.outputs.recorded-at }}
-          COMMIT: ${{ steps.build.outputs.candidate-sha }}
+          LABEL: ${{ needs.matrix.outputs.label }}
+          RECORDED_AT: ${{ needs.matrix.outputs.recorded-at }}
+          COMMIT: ${{ needs.matrix.outputs.candidate-sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           "$RUNNER_TEMP/bin/easysftp-bench" store
 
-      - name: Commit the result to main
-        if: inputs.store
-        working-directory: store-main
+      - name: Commit the sweep to main
         env:
-          NAME: ${{ steps.resolve.outputs.label }}
+          NAME: ${{ needs.matrix.outputs.label }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"

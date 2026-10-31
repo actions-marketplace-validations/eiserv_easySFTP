@@ -11,6 +11,7 @@ import (
 	"github.com/eiserv/easySFTP/internal/benchmark/runner"
 	"github.com/eiserv/easySFTP/internal/benchmark/scenario"
 	"github.com/eiserv/easySFTP/internal/benchmark/schema"
+	"github.com/eiserv/easySFTP/internal/benchmark/stats"
 	"github.com/eiserv/easySFTP/internal/benchmark/store"
 )
 
@@ -41,16 +42,18 @@ func runMatrix() error {
 	if err != nil {
 		return err
 	}
-	if opts.Repeats, err = envPositive("REPEATS", 1); err != nil {
+	// Three samples can yield a non-zero MAD. Keep explicit smaller counts
+	// available for quick exploratory sweeps; the store warns and marks them.
+	if opts.Repeats, err = envPositive("REPEATS", stats.MinRepeatsForAnalysis); err != nil {
 		return err
 	}
-	if opts.ConnectionsAxis, opts.ConnectionsDisplay, err = envAxis("MATRIX_CONNECTIONS", "1 2 4 8"); err != nil {
+	if opts.ConnectionsAxis, opts.ConnectionsDisplay, err = envAxis("MATRIX_CONNECTIONS", "1 2 4 8 16"); err != nil {
 		return err
 	}
-	if opts.ConcurrencyAxis, opts.ConcurrencyDisplay, err = envAxis("MATRIX_CONCURRENCY", "1 2 4 8 16 32 64"); err != nil {
+	if opts.ConcurrencyAxis, opts.ConcurrencyDisplay, err = envAxis("MATRIX_CONCURRENCY", "1 2 4 8 16 32 64 128"); err != nil {
 		return err
 	}
-	if opts.RequestAxis, opts.RequestDisplay, err = envRequestAxis("MATRIX_REQUEST_CONCURRENCY", "1 16 64"); err != nil {
+	if opts.RequestAxis, opts.RequestDisplay, err = envRequestAxis("MATRIX_REQUEST_CONCURRENCY", "1 16 64 128"); err != nil {
 		return err
 	}
 
@@ -94,11 +97,14 @@ func commonOptions() (driver.Options, error) {
 			Password:   os.Getenv("BENCH_PASSWORD"),
 			KnownHosts: os.Getenv("BENCH_KNOWN_HOSTS"),
 		},
-		LinkProbeBin:      os.Getenv("LINKPROBE_BIN"),
-		LinkIface:         os.Getenv("LINK_IFACE"),
-		LinkSudo:          os.Getenv("LINK_SUDO"),
+		LinkProbeBin: os.Getenv("LINKPROBE_BIN"),
+		LinkIface:    os.Getenv("LINK_IFACE"),
+		LinkSudo:     os.Getenv("LINK_SUDO"),
+		// The GitHub runner's instance-name variable is deliberately not
+		// read: the name is infrastructure naming with no analytical value,
+		// and it used to leak into every stored result's environment block
+		// (issue #245).
 		RunnerEnvironment: envOr("RUNNER_ENVIRONMENT", "local"),
-		RunnerName:        os.Getenv("RUNNER_NAME"),
 	}, nil
 }
 

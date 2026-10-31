@@ -3,7 +3,7 @@
 [![CI](https://github.com/eiserv/easySFTP/actions/workflows/ci.yml/badge.svg)](https://github.com/eiserv/easySFTP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Fast, secure and boring SFTP deploys for GitHub Actions.**
+**Secure and quick to set up SFTP deploys for GitHub Actions.**
 
 easySFTP uploads your build output to any SFTP server. The common case is a
 few self-explanatory lines; complex, professional setups stay fully
@@ -30,11 +30,12 @@ That's the whole thing. You only need to understand four things: where the
 server is, how to authenticate, what to upload, and where to put it.
 
 Get the host key once with `ssh-keyscan sftp.example.com | ssh-keygen -lf -`
-and store the `SHA256:...` line(s) as the `SFTP_HOST_KEY` secret. (Without it,
+and store its output as the `SFTP_HOST_KEY` secret; the `SHA256:...`
+fingerprint lines are read from it as-is, one per line. (Without it,
 the deploy fails rather than trusting an unverified server; you can opt out
 with `allow-any-host-key: true`, but that allows man-in-the-middle attacks.)
 
-> **Not just simple deploys.** easySFTP is boring on purpose for the common
+> **Not just simple deploys.** easySFTP is lightweight on purpose for the common
 > case, but complex and professional setups are fully supported through an
 > optional [config file](#need-more-multiple-deployments-and-advanced-control):
 > multiple deployment targets, per-target modes, proxy/bastion connections,
@@ -92,10 +93,16 @@ to be wrong when you read it. Each project's releases page answers that
 question better than this table can: [Dylan700][dylan-rel], [SamKirkland][sam-rel],
 [wlixcc][wlixcc-rel], [wangyucode][wang-rel].
 
+One speed note, since the table has rows that sound like speed claims: nothing
+in the [benchmark corpus](benchmarks/README.md) compares easySFTP to another
+action, so this page does not either. What the corpus does show is easySFTP
+against its own earlier releases on one fixed runner, and against the
+single-stream control of the line it ran over.
+
 easySFTP is a clean, from-scratch implementation in Go, inspired by
 [Dylan700/sftp-upload-action][dylan]:
 
-- compiled static binary instead of a Node.js runtime (fast startup, parallel transfers)
+- compiled static binary instead of a Node.js runtime (no runtime install, parallel transfers)
 - works on Linux, macOS **and** Windows runners, with no Docker required
 - host key verification, atomic uploads, retries with backoff, structured
   outputs and a job summary

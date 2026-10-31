@@ -5,6 +5,84 @@ New entries are generated automatically by [Release Please](https://github.com/g
 from [Conventional Commits](https://www.conventionalcommits.org/); this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.6](https://github.com/eiserv/easySFTP/compare/v3.8.5...v3.8.6) (2026-10-22)
+
+
+### Bug Fixes
+
+* **uploader:** make exclude patterns actually gitignore-compatible ([#327](https://github.com/eiserv/easySFTP/issues/327)) ([1cc0f5a](https://github.com/eiserv/easySFTP/commit/1cc0f5a210c7b16b65c114108fd341699f33c696))
+
+
+### Documentation
+
+* configuration.md exclude section gains the rule list, the ([1cc0f5a](https://github.com/eiserv/easySFTP/commit/1cc0f5a210c7b16b65c114108fd341699f33c696))
+
+## [3.8.5](https://github.com/eiserv/easySFTP/compare/v3.8.4...v3.8.5) (2026-10-11)
+
+
+### Bug Fixes
+
+* **benchmarks:** name a payload-clamped axis edge for what it is, and sweep past the cut-offs the corpus kept reporting ([#311](https://github.com/eiserv/easySFTP/issues/311)) ([5502513](https://github.com/eiserv/easySFTP/commit/5502513915082fa50f9e1a8b2870517d5de4c490))
+* **uploader:** remove a case-folded spelling before the upload, not after ([#326](https://github.com/eiserv/easySFTP/issues/326)) ([b627baf](https://github.com/eiserv/easySFTP/commit/b627bafad1cd0d4d31e3f8ccec80fe4b11b5b868))
+* **uploader:** warn before an empty plan deletes in clean or sync ([#325](https://github.com/eiserv/easySFTP/issues/325)) ([ff3192f](https://github.com/eiserv/easySFTP/commit/ff3192fd1eba832688487e6c954867c6bfb57c75)), closes [#317](https://github.com/eiserv/easySFTP/issues/317)
+
+
+### Documentation
+
+* clarify sync fast path for normalized-mtime builds ([#324](https://github.com/eiserv/easySFTP/issues/324)) ([3f82def](https://github.com/eiserv/easySFTP/commit/3f82defe2def0ed0d1343594cc47cd1959dffb4d))
+* **site:** publish the benchmark graphs on a page of their own, and refresh the analysis gallery ([#329](https://github.com/eiserv/easySFTP/issues/329)) ([7e5680e](https://github.com/eiserv/easySFTP/commit/7e5680e696addcef0b246edf201f8158fd8725b1))
+
+## [3.8.4](https://github.com/eiserv/easySFTP/compare/v3.8.3...v3.8.4) (2026-10-08)
+
+
+### Bug Fixes
+
+* **benchmarks:** stop recording the runner's instance name, un-ignore the gallery by name, keep the tagline inside what the corpus measured ([#310](https://github.com/eiserv/easySFTP/issues/310)) ([af5ec49](https://github.com/eiserv/easySFTP/commit/af5ec49c6fbd85052fcd344a48af771b2d6a3f86)), closes [#245](https://github.com/eiserv/easySFTP/issues/245)
+* **config:** accept merge keys and host_key lists, reject silent parser no-ops ([#290](https://github.com/eiserv/easySFTP/issues/290)) ([f2b0629](https://github.com/eiserv/easySFTP/commit/f2b06293c3d20f5aa89d6ea8b0fe2bb3adc82dc7))
+
+
+### Documentation
+
+* **contributing:** make the local-run example v3-valid and the layout map complete ([#307](https://github.com/eiserv/easySFTP/issues/307)) ([d2da43d](https://github.com/eiserv/easySFTP/commit/d2da43d84e34b636fb970c46fede9bcb1f3be69d)), closes [#232](https://github.com/eiserv/easySFTP/issues/232)
+
+## [3.8.3](https://github.com/eiserv/easySFTP/compare/v3.8.2...v3.8.3) (2026-10-06)
+
+
+### Bug Fixes
+
+* **autocache:** poll a lock create that Windows denies while the sidecar is delete-pending ([#305](https://github.com/eiserv/easySFTP/issues/305)) ([4bfe293](https://github.com/eiserv/easySFTP/commit/4bfe293b54b56197d9a6e2405cbde8da899f232c))
+* **uploader:** honor a watchdog kill during a redial, six reporting cleanups, and a docs-sample guard test ([#298](https://github.com/eiserv/easySFTP/issues/298)) ([39b0f14](https://github.com/eiserv/easySFTP/commit/39b0f1409318a7dee0b1aad6c9f3261e964646c3))
+* **uploader:** pipeline file writes at request_concurrency, not one packet per round-trip ([#301](https://github.com/eiserv/easySFTP/issues/301)) ([18dd3d4](https://github.com/eiserv/easySFTP/commit/18dd3d469d26535d672019bc4456e48a98d74a19))
+
+## [3.8.2](https://github.com/eiserv/easySFTP/compare/v3.8.1...v3.8.2) (2026-10-04)
+
+
+### Bug Fixes
+
+* **config:** refuse two sync deployments into one target ([#296](https://github.com/eiserv/easySFTP/issues/296)) ([5c8eaab](https://github.com/eiserv/easySFTP/commit/5c8eaab95ced367c74253cbace37590372658342))
+* **hostkeys:** accept the ssh-keygen -lf lines the quick start tells users to store ([#304](https://github.com/eiserv/easySFTP/issues/304)) ([22cad70](https://github.com/eiserv/easySFTP/commit/22cad70f0e2d8579d203886f9845c29dc807380a))
+* **hostkeys:** ask the server for the key types the known-hosts lines pin ([#294](https://github.com/eiserv/easySFTP/issues/294)) ([1513290](https://github.com/eiserv/easySFTP/commit/1513290c2e792dfdccf46af74ad74f8519159967)), closes [#282](https://github.com/eiserv/easySFTP/issues/282)
+* **security:** pin the attested source commit for tag refs too ([#299](https://github.com/eiserv/easySFTP/issues/299)) ([e288f18](https://github.com/eiserv/easySFTP/commit/e288f18e1e5200f38657b92b205eb8f5b813d8c8))
+* **security:** split the benchmark jobs that measure from the jobs that write ([#300](https://github.com/eiserv/easySFTP/issues/300)) ([2ed0861](https://github.com/eiserv/easySFTP/commit/2ed08618ec2f06957678be0d15e122a1aac01c23))
+* **uploader:** bound the whole connect path by advanced.timeout, not just the TCP dial ([#295](https://github.com/eiserv/easySFTP/issues/295)) ([95724ca](https://github.com/eiserv/easySFTP/commit/95724ca84ca30a9a1b6c9a8026efe75ae95a8313))
+* **uploader:** count granted connections, not touched pool slots ([#293](https://github.com/eiserv/easySFTP/issues/293)) ([1c1ff58](https://github.com/eiserv/easySFTP/commit/1c1ff589ba2b10346dad23e6bf8a749e92fb6091)), closes [#281](https://github.com/eiserv/easySFTP/issues/281)
+* **uploader:** delete the entries a sync type change collides with, before the upload ([#297](https://github.com/eiserv/easySFTP/issues/297)) ([4c8f2c5](https://github.com/eiserv/easySFTP/commit/4c8f2c578e24f0935dfe5d910f8d3d22716a1b09))
+* **uploader:** refuse the root of a Windows drive in checkRemoteRoot ([765bd4d](https://github.com/eiserv/easySFTP/commit/765bd4db4401138beea61bb53f188d2cfd05e042)), closes [#285](https://github.com/eiserv/easySFTP/issues/285)
+* **uploader:** walk through a source that is a symlink or a junction ([#292](https://github.com/eiserv/easySFTP/issues/292)) ([bd0d409](https://github.com/eiserv/easySFTP/commit/bd0d409944f79f7b409d51204c274e9ecec483ba))
+
+
+### Documentation
+
+* **autotune:** correct handshake locking explanation ([#291](https://github.com/eiserv/easySFTP/issues/291)) ([13b2a90](https://github.com/eiserv/easySFTP/commit/13b2a90c305269a453ffa8d66cc57a9af0faed51))
+
+## [3.8.1](https://github.com/eiserv/easySFTP/compare/v3.8.0...v3.8.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* **benchmark:** require three repeats for meaningful matrix MAD ([#271](https://github.com/eiserv/easySFTP/issues/271)) ([519033c](https://github.com/eiserv/easySFTP/commit/519033cdab29e7fa034cfa798df3c839d4eb2014))
+* **deps:** update x/crypto to v0.56.0 and Go to 1.26.7 ([#272](https://github.com/eiserv/easySFTP/issues/272)) ([2113772](https://github.com/eiserv/easySFTP/commit/211377205adc244850c9304adb938ebf7c2e25c5))
+
 ## [3.8.0](https://github.com/eiserv/easySFTP/compare/v3.7.0...v3.8.0) (2026-08-30)
 
 

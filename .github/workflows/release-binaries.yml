@@ -20,10 +20,13 @@ jobs:
     outputs:
       commit: ${{ steps.release.outputs.commit }}
     steps:
+      # Reads tags and the version file; the token has no business staying on
+      # disk beyond the checkout (issue #283).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify tag, version, release, and ancestry
         id: release
@@ -31,6 +34,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+          RUN_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -39,6 +43,17 @@ jobs:
           fi
           git show-ref --verify --quiet "refs/tags/$TAG"
           commit=$(git rev-parse "$TAG^{}")
+          # The attestation below signs this run's own commit (github.sha) as
+          # the build source, and every job after this one builds from the
+          # tag's commit. The two agree on the release path, where the push
+          # that starts the run is the release commit itself, but a
+          # workflow_dispatch defaults to a branch (usually main), where they
+          # differ and the attestation would name a commit the binaries were
+          # not built from (issue #284). Stop here, before anything is built.
+          if [[ "$RUN_SHA" != "$commit" ]]; then
+            echo "::error::This run started from $RUN_SHA, but tag $TAG points at $commit. Start the repair from the tag itself (Run workflow: Use workflow from, then pick the tag) so the attestation names the commit the binaries are built from; see docs/RELEASING.md."
+            exit 1
+          fi
           git fetch --no-tags origin main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "$commit" origin/main; then
             echo "::error::Release tag $TAG is not reachable from main"
@@ -60,9 +75,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Runs "go test" on the release source; nothing here pushes (issue #283).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -100,9 +117,11 @@ jobs:
             goarch: arm64
             asset: easysftp_windows_arm64.exe
     steps:
+      # Cross-compiles the release source; nothing here pushes (issue #283).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -122,7 +141,7 @@ jobs:
           mkdir dist
           go build -trimpath -ldflags="-s -w -X main.buildVersion=$TAG" -o "dist/$ASSET" ./cmd/easysftp
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
@@ -158,7 +177,7 @@ jobs:
             windows: true
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-${{ matrix.asset }}
 
@@ -195,7 +214,7 @@ jobs:
           ref: ${{ needs.validate.outputs.commit }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
           path: release

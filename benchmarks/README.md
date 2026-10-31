@@ -94,7 +94,7 @@ Markdown:
 | Key | What it is |
 |---|---|
 | `candidate_ref`, `baseline_ref`, `repeats`, `runner`, `settings` | what was measured and how |
-| `environment` | OS, kernel, architecture, CPU model, CPU count, Go version |
+| `environment` | OS, kernel, architecture, CPU model, CPU count, Go version; `runner_name` was recorded up to v3.8.3 and is not set any more (issue #245) |
 | `link` | the network path: probed RTT, a throughput control, the server's load, and which shaping was asked for (see "The link profile" below) |
 | `scenarios` | the payload behind each scenario name |
 | `results[]` | one row per (build, scenario, link profile): the aggregate |
@@ -170,16 +170,26 @@ The axes are therefore capped against the payload, per scenario, by
   has anything left to pipeline.
 
 What that pays for is the two things phase 5 asks for: a `concurrency` axis that
-runs to 64 so the optimum can be interior, and a `request_concurrency` axis that
-is swept for real instead of being declared and left empty. `axes` keeps what
-was requested, `axes.per_scenario` records what each scenario was actually
+runs past the point the optimum should sit at, and a `request_concurrency` axis
+that is swept for real instead of being declared and left empty. `axes` keeps
+what was requested, `axes.per_scenario` records what each scenario was actually
 measured over, and `matrix.md` prints both next to the scenario table. A cell
 missing from the declared grid was not skipped; it would have been a duplicate.
+The `request_concurrency` axis is also clamped to the packet count of the
+scenario's largest file, exactly the way the file count clamps the other two
+axes: pkg/sftp sizes its per-file pipeline at fileSize/32KiB + 1 and clamps it
+at the setting, so a value above the packet count would measure the same
+pipeline under another name.
 
 `scaling[].best_at_axis_max` is the honesty check on top: it names the axes
 whose largest swept value is the best cell. Where it is non-empty the optimum is
 at or beyond the edge of the sweep, and anything fitted to those numbers
-extrapolates.
+extrapolates. An edge the payload itself bounds is named for that in
+`matrix.md`: the requested axis was clamped down to the file count (or the
+largest file's packet count), so the edge is the largest distinct configuration
+the payload has and not a place the sweep chose to stop. In the stored v3.8.3
+sweep, seven of nine scenarios still sat on an extendable edge, which is what
+raised the defaults past the old caps.
 
 ### What `auto` costs
 
@@ -367,6 +377,19 @@ Three things to know when reading it:
   is slow" from "easySFTP is slow", not `pkg/sftp` from the line. When a
   scenario's own MiB/s sits at the single-stream control, the run was network
   bound and a code delta on it says nothing.
+- **Stored results before the pipelining fix are pre-pipelining.** Until
+  issue #276 was fixed, every upload - and the control's own write - sent one
+  32 KiB packet per round-trip: `request_concurrency` reached the SFTP client
+  but the write loop never used it, and the single-stream control and the
+  scenarios measured the same stop-and-wait mechanism. A stored
+  single-stream control close to a `single` cell therefore does not show that
+  the run was network bound; it shows that both moved one packet per
+  round-trip. The fix pipelines both (the uploader via
+  `ReadFromWithConcurrency`, the control the same way), so from it on, that
+  comparison means what this section says it means. Expect
+  `assumedStreamBytesPerSecond`, `uploadsInFlightPerConnection` and the regret
+  replay to need refitting once a post-fix sweep exists; the ones fitted to
+  stop-and-wait rates describe a mechanism the uploader no longer uses.
 - **Each profile is probed twice**, before and after its own measured runs. A
   start and an end probe of the *same* profile are comparable, and that is what
   makes drift over a multi-hour sweep visible. Two probes of different profiles
@@ -418,6 +441,14 @@ over, the probed RTT p50 of its baseline profile, the paths of all its files, an
 the candidate's median milliseconds per scenario (or, for a matrix run, its
 best cell), so a reader does not have to open every file.
 
+Matrix entries also include `repeats` and set `below_analysis_threshold: true`
+when fewer than three repeats were requested. With the lower-middle median,
+one sample yields a null MAD and two always yield zero. Three is the minimum
+that can show dispersion, not a guarantee of sufficient data when repeats fail.
+The CLI and both matrix workflow entry points default to three repeats. Explicit
+smaller counts remain available for exploratory runs; storing them warns on
+stderr and marks the index. Historical result files stay unchanged.
+
 `trend.csv` is the same set flattened for plotting: one row per stored
 non-matrix result, scenario and link profile, carrying the timestamp, the
 version, the runner, the link the row was measured over, the duration statistics
@@ -428,6 +459,14 @@ files are regenerated in full on every store, so they always describe what is
 actually on disk. Columns whose data predates the metric (peak RSS and CPU time
 on schema 1 results, the link columns on anything measured before the probe
 existed) are empty rather than zero.
+
+One warning the flat format cannot carry: the `runner` column is the
+comparability key, not decoration. The v3.3.1 rows were measured on a
+GitHub-hosted 4-CPU Azure runner and every later row on the self-hosted
+10-CPU one, so a plot that ignores the column and reads `median_ms` straight
+down the file shows a 5x improvement between two adjacent releases that is
+entirely a change of machine. Filter or group by `runner` before comparing
+rows.
 
 ## Official versus manual versus matrix
 
